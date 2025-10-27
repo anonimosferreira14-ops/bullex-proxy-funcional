@@ -1,6 +1,7 @@
 import express from "express";
 import { Server } from "socket.io";
-import { io as SocketIOClient } from "socket.io-client";
+import pkg from "socket.io-client";
+const SocketIOClient = pkg.io || pkg; // compatível com versões CJS e ESM
 import cors from "cors";
 
 const app = express();
