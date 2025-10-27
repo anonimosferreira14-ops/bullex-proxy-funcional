@@ -1,7 +1,9 @@
 import express from "express";
 import { Server } from "socket.io";
-import pkg from "socket.io-client";
 import cors from "cors";
+import pkg from "socket.io-client"; // <- importação compatível com CommonJS
+const SocketIOClient = pkg.default || pkg.io || pkg; // <- garante compatibilidade entre versões
+
 
 const { io: SocketIOClient } = pkg;
 
