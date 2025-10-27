@@ -1,11 +1,7 @@
 import express from "express";
 import { Server } from "socket.io";
+import { io as SocketIOClient } from "socket.io-client";
 import cors from "cors";
-import pkg from "socket.io-client"; // <- importação compatível com CommonJS
-const SocketIOClient = pkg.default || pkg.io || pkg; // <- garante compatibilidade entre versões
-
-
-const { io: SocketIOClient } = pkg;
 
 const app = express();
 app.use(cors());
@@ -14,7 +10,6 @@ const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Proxy BullEx ativo e escutando em 0.0.0.0:${PORT}`);
 });
-
 
 const io = new Server(server, {
   cors: { origin: "*" },
@@ -29,7 +24,7 @@ io.on("connection", (clientSocket) => {
   clientSocket.on("authenticate", ({ ssid }) => {
     console.log("🔐 Autenticando com BullEx...");
 
-    const bullexSocket = SocketIOClient("wss://ws.trade.bull-ex.com", {
+    const bullexSocket = SocketIOClient("https://ws.trade.bull-ex.com", {
       path: "/socket.io/",
       transports: ["websocket"],
       reconnection: true,
@@ -38,10 +33,9 @@ io.on("connection", (clientSocket) => {
 
     connections.set(clientSocket.id, bullexSocket);
 
-    // Eventos da BullEx → Cliente
     bullexSocket.on("connect", () => {
       console.log("✅ Conectado à BullEx WebSocket");
-      bullexSocket.emit("authenticate", { ssid, protocol: 3 });
+      bullexSocket.emit("authenticate", { ssid, protocol: 4 });
     });
 
     bullexSocket.on("authenticated", (data) => {
@@ -82,7 +76,7 @@ io.on("connection", (clientSocket) => {
 app.get("/health", (req, res) => {
   res.json({ status: "ok", connections: connections.size });
 });
-app.get('/health', (req, res) => res.send('OK'));
+
 app.get("/", (req, res) => {
   res.json({ message: "Proxy BullEx ativo", status: "ok" });
 });
