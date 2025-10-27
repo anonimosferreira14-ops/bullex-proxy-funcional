@@ -8,10 +8,11 @@ const { io: SocketIOClient } = pkg;
 const app = express();
 app.use(cors());
 
-const PORT = process.env.PORT || 8080;
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Proxy BullEx rodando na porta ${PORT}`);
+const PORT = process.env.PORT || 10000;
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Proxy BullEx ativo e escutando em 0.0.0.0:${PORT}`);
 });
+
 
 const io = new Server(server, {
   cors: { origin: "*" },
