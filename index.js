@@ -4,18 +4,15 @@
 
 import express from "express";
 import { Server } from "socket.io";
-import pkg from "socket.io-client";
 import cors from "cors";
-
-// Corrige import para CommonJS e ESM (Render usa Node 25)
-const SocketIOClient = pkg.io ? pkg.io : pkg;
+import socketIOClient from "socket.io-client"; // ✅ cliente compatível com v2
 
 const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Proxy BullEx ativo e escutando em 0.0.0.0:${PORT}`);
+  console.log(`🚀 Proxy BullEx ativo na porta ${PORT}`);
 });
 
 const io = new Server(server, {
@@ -25,33 +22,29 @@ const io = new Server(server, {
 
 const connections = new Map();
 
-// ==========================================
-//  🔁 Conexão do Lovable → BullEx
-// ==========================================
 io.on("connection", (clientSocket) => {
   console.log("✅ Cliente Lovable conectado:", clientSocket.id);
 
   clientSocket.on("authenticate", ({ ssid }) => {
-    if (!ssid) {
-      console.warn("❌ SSID ausente — conexão ignorada.");
-      clientSocket.emit("unauthorized", { reason: "SSID ausente" });
-      return;
-    }
-
     console.log("🔐 Autenticando com BullEx...");
 
-    const bullexSocket = SocketIOClient("https://ws.trade.bull-ex.com", {
+    // ⚙️ Usa path + query compatível com EIO=3 (Engine.IO 3)
+    const bullexSocket = socketIOClient("https://ws.trade.bull-ex.com", {
       path: "/socket.io/",
-      transports: ["websocket"],
+      transports: ["websocket", "polling"],
+      query: { EIO: 3 },
       reconnection: true,
-      reconnectionDelay: 4000,
+      reconnectionDelay: 5000
     });
 
     connections.set(clientSocket.id, bullexSocket);
 
     bullexSocket.on("connect", () => {
       console.log("✅ Conectado à BullEx WebSocket");
-      bullexSocket.emit("authenticate", { ssid, protocol: 4 });
+      bullexSocket.emit("authenticate", {
+        name: "authenticate",
+        msg: { ssid, protocol: 4 }
+      });
     });
 
     bullexSocket.on("authenticated", (data) => {
@@ -64,14 +57,19 @@ io.on("connection", (clientSocket) => {
       clientSocket.emit("unauthorized", data);
     });
 
-    // Eventos BullEx → Lovable
-    bullexSocket.on("candles-generated", (data) => clientSocket.emit("candles", data));
-    bullexSocket.on("positions-state", (data) => clientSocket.emit("positions", data));
-    bullexSocket.on("balance-changed", (data) => clientSocket.emit("balance", data));
+    bullexSocket.on("candles-generated", (data) =>
+      clientSocket.emit("candles", data)
+    );
+    bullexSocket.on("positions-state", (data) =>
+      clientSocket.emit("positions", data)
+    );
+    bullexSocket.on("balance-changed", (data) =>
+      clientSocket.emit("balance", data)
+    );
 
     bullexSocket.on("disconnect", (reason) => {
       console.warn("🔴 Desconectado da BullEx:", reason);
-      clientSocket.emit("disconnected", reason);
+      clientSocket.emit("disconnected");
     });
 
     bullexSocket.on("error", (error) => {
@@ -80,7 +78,6 @@ io.on("connection", (clientSocket) => {
     });
   });
 
-  // Cleanup quando cliente Lovable desconecta
   clientSocket.on("disconnect", () => {
     console.log("❌ Cliente Lovable desconectado:", clientSocket.id);
     const bull = connections.get(clientSocket.id);
@@ -91,13 +88,7 @@ io.on("connection", (clientSocket) => {
   });
 });
 
-// ==========================================
-//  🩺 Rotas de monitoramento
-// ==========================================
-app.get("/health", (req, res) => {
+app.get("/", (req, res) => {
   res.json({ status: "ok", connections: connections.size });
 });
 
-app.get("/", (req, res) => {
-  res.json({ message: "Proxy BullEx ativo ✅", status: "ok" });
-});
