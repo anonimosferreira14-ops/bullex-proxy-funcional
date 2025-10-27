@@ -81,3 +81,6 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", connections: connections.size });
 });
 app.get('/health', (req, res) => res.send('OK'));
+app.get("/", (req, res) => {
+  res.json({ message: "Proxy BullEx ativo", status: "ok" });
+});
