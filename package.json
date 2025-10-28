@@ -2,31 +2,17 @@
   "name": "bullex-proxy-funcional",
   "version": "1.0.0",
   "type": "module",
-  "description": "Proxy BullEx com WebSocket - Render Deploy",
-  "main": "index.js",
   "engines": {
     "node": "20.x"
   },
   "dependencies": {
     "express": "^4.18.2",
     "socket.io": "^4.6.1",
-    "cors": "^2.8.5",
-    "ws": "^8.14.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
+    "socket.io-client": "^2.5.0",
+    "cors": "^2.8.5"
   },
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
-  },
-  "keywords": [
-    "bullex",
-    "trading",
-    "websocket",
-    "proxy",
-    "render"
-  ],
-  "author": "Your Name",
-  "license": "MIT"
+    "start": "node index.js"
+  }
 }
+
