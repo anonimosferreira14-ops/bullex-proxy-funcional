@@ -18,20 +18,132 @@ const io = new Server(server, {
 
 const connections = new Map();
 
-// Função auxiliar: reconexão
+// ====== CONFIGURAÇÕES DE RATE LIMITING ======
+const RATE_LIMITS = {
+  "candles-generated": { interval: 500, maxEvents: 5 }, // Max 5 eventos a cada 500ms
+  "price-splitter.client-buyback-generated": { interval: 1000, maxEvents: 3 }, // Max 3 a cada 1s
+  "positions-state": { interval: 1000, maxEvents: 10 },
+  "balance-changed": { interval: 500, maxEvents: 10 },
+};
+
+// ====== EVENT AGGREGATOR (Agrupa eventos similares) ======
+class EventAggregator {
+  constructor(clientId) {
+    this.clientId = clientId;
+    this.buffer = {};
+    this.timers = {};
+    this.rateLimitTrackers = {};
+
+    // Inicializar rate limiters
+    Object.keys(RATE_LIMITS).forEach((event) => {
+      this.rateLimitTrackers[event] = { count: 0, resetTime: 0 };
+    });
+  }
+
+  // Verificar rate limit
+  isWithinRateLimit(eventName) {
+    const config = RATE_LIMITS[eventName];
+    if (!config) return true;
+
+    const now = Date.now();
+    const tracker = this.rateLimitTrackers[eventName];
+
+    if (now > tracker.resetTime) {
+      tracker.count = 0;
+      tracker.resetTime = now + config.interval;
+    }
+
+    if (tracker.count < config.maxEvents) {
+      tracker.count++;
+      return true;
+    }
+
+    return false;
+  }
+
+  // Agregar evento
+  aggregate(eventName, data) {
+    // Se não estiver no rate limit, descartar
+    if (!this.isWithinRateLimit(eventName)) {
+      return false; // Silenciosamente ignorado
+    }
+
+    // Candles: apenas enviar o último
+    if (eventName === "candles-generated") {
+      this.buffer[eventName] = data;
+      return true;
+    }
+
+    // Pressure: manter atualizado
+    if (eventName === "price-splitter.client-buyback-generated") {
+      this.buffer[eventName] = data;
+      return true;
+    }
+
+    return true;
+  }
+
+  // Enviar evento agregado
+  sendAggregated(socket, eventName, data) {
+    // Limpar timer anterior se houver
+    if (this.timers[eventName]) {
+      clearTimeout(this.timers[eventName]);
+    }
+
+    // Agendar envio após 100ms (batching)
+    this.timers[eventName] = setTimeout(() => {
+      socket.emit(eventName, data);
+      delete this.buffer[eventName];
+    }, 100);
+  }
+
+  // Limpar
+  clear() {
+    Object.values(this.timers).forEach((timer) => clearTimeout(timer));
+    this.buffer = {};
+    this.timers = {};
+  }
+}
+
+// ====== FUNCTION: Conectar à BullEx ======
 function connectToBullEx(ssid, clientSocket) {
-  console.log("🔐 Autenticando com BullEx via WebSocket...");
+  console.log(`📌 [${clientSocket.id.substring(0, 8)}] Autenticando com BullEx...`);
 
   const bullexWs = new WebSocket("wss://ws.trade.bull-ex.com/echo/websocket");
+  let reconnectAttempts = 0;
+  const maxReconnectAttempts = 5;
+  let pingInterval = null;
+
+  // Agregador de eventos
+  const aggregator = new EventAggregator(clientSocket.id);
+
+  // Eventos que NÃO precisam de log
+  const silentEvents = [
+    "timeSync",
+    "pong",
+    "ping",
+    "candles-generated",
+    "price-splitter.client-buyback-generated",
+    "positions-state",
+  ];
 
   bullexWs.on("open", () => {
-    console.log("✅ Conectado à BullEx via WebSocket. Enviando autenticação...");
+    console.log(`✅ [${clientSocket.id.substring(0, 8)}] WebSocket aberto. Autenticando...`);
+    reconnectAttempts = 0;
+
     bullexWs.send(
       JSON.stringify({
         name: "authenticate",
         msg: { ssid, protocol: 3 },
       })
     );
+
+    // Heartbeat a cada 20s
+    pingInterval = setInterval(() => {
+      if (bullexWs.readyState === WebSocket.OPEN) {
+        bullexWs.send(JSON.stringify({ name: "ping" }));
+      }
+    }, 20000);
   });
 
   bullexWs.on("message", (message) => {
@@ -39,109 +151,187 @@ function connectToBullEx(ssid, clientSocket) {
       const data = JSON.parse(message.toString());
       const eventName = data.name || "unknown";
 
+      // Log apenas eventos importantes
+      if (!silentEvents.includes(eventName)) {
+        console.log(`📨 [${clientSocket.id.substring(0, 8)}] ${eventName}`);
+      }
+
       switch (eventName) {
         case "authenticated":
-          console.log("🎯 Autenticado com sucesso na BullEx!");
+          console.log(`🎯 [${clientSocket.id.substring(0, 8)}] Autenticado com sucesso!`);
           clientSocket.emit("authenticated", data);
           break;
 
         case "unauthorized":
-          console.warn("🚫 Autenticação negada na BullEx");
+          console.warn(`🚫 [${clientSocket.id.substring(0, 8)}] SSID inválido`);
           clientSocket.emit("unauthorized", data);
           break;
 
-        case "balance-changed":
-          clientSocket.emit("balance", data);
+        case "ping":
+          bullexWs.send(JSON.stringify({ name: "pong" }));
           break;
 
+        case "pong":
+        case "timeSync":
+          // Ignorar silenciosamente
+          break;
+
+        // ====== TRATAMENTO DE HIGH-FREQUENCY DATA ======
+
         case "candles-generated":
-          clientSocket.emit("candles", data);
+          // Agregar candles (enviar apenas os últimos)
+          if (aggregator.aggregate(eventName, data)) {
+            aggregator.sendAggregated(clientSocket, "candles", data);
+          }
+          break;
+
+        case "price-splitter.client-buyback-generated":
+          // Agregar pressure (call/put)
+          if (aggregator.aggregate(eventName, data)) {
+            aggregator.sendAggregated(clientSocket, "pressure", data);
+          }
           break;
 
         case "positions-state":
-          clientSocket.emit("positions", data);
+          // Posições: enviar com throttle
+          if (aggregator.aggregate(eventName, data)) {
+            aggregator.sendAggregated(clientSocket, "positions", data);
+          }
+          break;
+
+        // ====== EVENTOS CRÍTICOS (Enviar imediatamente) ======
+
+        case "balance-changed":
+          // Sempre enviar imediatamente (importante!)
+          clientSocket.emit("balance", data);
+          console.log(`💰 [${clientSocket.id.substring(0, 8)}] Saldo: ${data.msg?.current_balance?.amount || "N/A"}`);
           break;
 
         case "position-changed":
+          // Sempre enviar imediatamente (crítico!)
+          const status = data.msg?.status;
+          const result = data.msg?.result;
+          if (status === "closed") {
+            console.log(`${result === "win" ? "✅" : "❌"} [${clientSocket.id.substring(0, 8)}] Posição ${result}`);
+          }
           clientSocket.emit("position-changed", data);
           break;
 
+        case "result":
+          // Resultado de operação
+          clientSocket.emit("result", data);
+          break;
+
         default:
-          console.log("📡 Evento:", eventName);
+          // Eventos desconhecidos: enviar mas com log
           clientSocket.emit("event", data);
           break;
       }
     } catch (err) {
-      console.error("⚠️ Erro ao parsear mensagem da BullEx:", err.message);
+      console.error(
+        `⚠️ [${clientSocket.id.substring(0, 8)}] Erro ao parsear:`,
+        err.message
+      );
     }
   });
 
   bullexWs.on("error", (err) => {
-    console.error("⚠️ Erro BullEx:", err.message);
+    console.error(`⚠️ [${clientSocket.id.substring(0, 8)}] Erro:`, err.message);
     clientSocket.emit("error", { message: err.message });
   });
 
   bullexWs.on("close", () => {
-    console.warn("🔴 Conexão com BullEx encerrada");
+    console.warn(`🔴 [${clientSocket.id.substring(0, 8)}] Conexão encerrada`);
+
+    // Limpar
+    if (pingInterval) clearInterval(pingInterval);
+    aggregator.clear();
+
     clientSocket.emit("disconnected");
 
-    // Tentativa de reconexão automática
-    setTimeout(() => {
-      if (clientSocket.connected) {
-        console.log("♻️ Tentando reconexão com BullEx...");
+    // Reconexão com limite
+    if (reconnectAttempts < maxReconnectAttempts && clientSocket.connected) {
+      reconnectAttempts++;
+      console.log(
+        `🔄 [${clientSocket.id.substring(0, 8)}] Reconexão ${reconnectAttempts}/${maxReconnectAttempts}...`
+      );
+
+      setTimeout(() => {
         connectToBullEx(ssid, clientSocket);
-      }
-    }, 5000);
+      }, 5000);
+    } else if (reconnectAttempts >= maxReconnectAttempts) {
+      console.error(`❌ [${clientSocket.id.substring(0, 8)}] Máx reconexões atingido`);
+      clientSocket.emit("error", { message: "Falha de conexão permanente" });
+    }
   });
 
-  // Heartbeat a cada 20s para manter viva
-  const pingInterval = setInterval(() => {
-    if (bullexWs.readyState === WebSocket.OPEN) {
-      bullexWs.send(JSON.stringify({ name: "ping" }));
-    }
-  }, 20000);
-
-  bullexWs.on("close", () => clearInterval(pingInterval));
-
-  connections.set(clientSocket.id, bullexWs);
+  connections.set(clientSocket.id, {
+    ws: bullexWs,
+    aggregator: aggregator,
+  });
 }
 
-// Evento de conexão Lovable
+// ====== SOCKET.IO: Conexão do Cliente ======
 io.on("connection", (clientSocket) => {
-  console.log("✅ Cliente Lovable conectado:", clientSocket.id);
+  console.log(`✅ Cliente Lovable: ${clientSocket.id.substring(0, 8)}`);
 
   clientSocket.on("authenticate", ({ ssid }) => {
     if (!ssid) {
-      console.warn("⚠️ Nenhum SSID recebido — abortando autenticação");
+      console.warn(`⚠️ [${clientSocket.id.substring(0, 8)}] SSID não fornecido`);
+      clientSocket.emit("error", { message: "SSID não fornecido" });
       return;
     }
     connectToBullEx(ssid, clientSocket);
   });
 
-  // Proxy para envio de mensagens do cliente
+  // Proxy para envio de mensagens
   clientSocket.on("sendMessage", (data) => {
-    const ws = connections.get(clientSocket.id);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(data));
+    const connection = connections.get(clientSocket.id);
+    if (connection && connection.ws.readyState === WebSocket.OPEN) {
+      const messageData = data.msg || data;
+      console.log(`📤 [${clientSocket.id.substring(0, 8)}] ${messageData.name || "message"}`);
+      connection.ws.send(JSON.stringify(messageData));
+    } else {
+      console.warn(`⚠️ [${clientSocket.id.substring(0, 8)}] WebSocket não conectado`);
+      clientSocket.emit("error", { message: "WebSocket não conectado" });
     }
   });
 
-  // Limpeza ao desconectar
+  // Limpeza
   clientSocket.on("disconnect", () => {
-    console.log("❌ Cliente Lovable desconectado:", clientSocket.id);
-    const ws = connections.get(clientSocket.id);
-    if (ws) {
-      ws.close();
+    console.log(`❌ [${clientSocket.id.substring(0, 8)}] Desconectado`);
+    const connection = connections.get(clientSocket.id);
+    if (connection) {
+      connection.ws.close();
+      connection.aggregator.clear();
       connections.delete(clientSocket.id);
     }
   });
 });
 
-// Health check endpoint
+// ====== ENDPOINTS ======
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", connections: connections.size });
+  res.json({
+    status: "ok",
+    activeConnections: connections.size,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/status", (req, res) => {
+  const stats = {
+    uptime: process.uptime(),
+    activeConnections: connections.size,
+    memory: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`,
+    rateLimit: RATE_LIMITS,
+  };
+  res.json(stats);
 });
 
 app.get("/", (req, res) => {
-  res.json({ message: "Proxy BullEx ativo", status: "ok" });
+  res.json({
+    message: "Proxy BullEx Otimizado v3",
+    status: "ok",
+    connections: connections.size,
+  });
 });
