@@ -17,6 +17,7 @@ const io = new Server(server, {
 });
 
 const connections = new Map();
+const clientBalances = new Map(); // Armazenar saldos por cliente
 
 // ====== RATE LIMITING ======
 const RATE_LIMITS = {
@@ -156,6 +157,37 @@ function connectToBullEx(ssid, clientSocket) {
         return;
       }
 
+      // ====== CRÍTICO: Capturar SALDO de balance-changed ======
+      if (event === "balance-changed") {
+        const balanceAmount = data?.msg?.current_balance?.amount;
+        if (balanceAmount) {
+          console.log(`💰 [${shortId}] Saldo capturado: $${(balanceAmount / 100).toFixed(2)}`);
+          clientBalances.set(clientSocket.id, balanceAmount);
+          
+          // Reemitir para cliente
+          clientSocket.emit("balance-changed", data);
+          clientSocket.emit("balance", data);
+          
+          // Também enviar um evento "current-balance" simplificado
+          clientSocket.emit("current-balance", {
+            amount: balanceAmount,
+            currency: data?.msg?.current_balance?.currency || "USD",
+            timestamp: Date.now(),
+          });
+        }
+        return;
+      }
+
+      if (event === "position-changed") {
+        const status = data.msg?.status;
+        const result = data.msg?.result;
+        if (status === "closed") {
+          console.log(`${result === "win" ? "✅" : "❌"} [${shortId}] ${result}`);
+        }
+        clientSocket.emit("position-changed", data);
+        return;
+      }
+
       // High-frequency events (agregados)
       if (event === "candles-generated") {
         if (aggregator.aggregate(event, data)) {
@@ -178,33 +210,8 @@ function connectToBullEx(ssid, clientSocket) {
         return;
       }
 
-      // Eventos críticos (imediatos)
-      if (event === "balance-changed") {
-        console.log(`💵 [${shortId}] Saldo alterado`);
-        clientSocket.emit("balance-changed", data);
-        clientSocket.emit("balance", data);
-        return;
-      }
-
-      if (event === "position-changed") {
-        const status = data.msg?.status;
-        const result = data.msg?.result;
-        if (status === "closed") {
-          console.log(`${result === "win" ? "✅" : "❌"} [${shortId}] ${result}`);
-        }
-        clientSocket.emit("position-changed", data);
-        return;
-      }
-
-      if (event === "balances") {
-        console.log(`💰 [${shortId}] Saldos recebidos`);
-        clientSocket.emit("balances", data);
-        clientSocket.emit("balance", data);
-        return;
-      }
-
       // ====== REEMITIR TUDO MAIS ======
-      console.log(`📤 [${shortId}] Reenviando evento: ${event}`);
+      console.log(`📤 [${shortId}] Reemitindo: ${event}`);
       clientSocket.emit(event, data);
 
     } catch (err) {
@@ -216,6 +223,7 @@ function connectToBullEx(ssid, clientSocket) {
     console.warn(`🔴 [${shortId}] Conexão encerrada`);
     if (pingInterval) clearInterval(pingInterval);
     aggregator.clear();
+    clientBalances.delete(clientSocket.id);
     clientSocket.emit("disconnected");
 
     if (reconnectAttempts < maxReconnectAttempts && clientSocket.connected) {
@@ -257,6 +265,22 @@ io.on("connection", (clientSocket) => {
     }
   });
 
+  // ====== NOVO: Endpoint para pedir saldo atual ======
+  clientSocket.on("get-balance", () => {
+    const balance = clientBalances.get(clientSocket.id);
+    if (balance !== undefined) {
+      console.log(`💰 [${shortId}] Enviando saldo: $${(balance / 100).toFixed(2)}`);
+      clientSocket.emit("balance", {
+        msg: {
+          current_balance: {
+            amount: balance,
+            currency: "USD",
+          },
+        },
+      });
+    }
+  });
+
   clientSocket.on("disconnect", () => {
     const connection = connections.get(clientSocket.id);
     if (connection) {
@@ -264,6 +288,7 @@ io.on("connection", (clientSocket) => {
       connection.aggregator.clear();
       connections.delete(clientSocket.id);
     }
+    clientBalances.delete(clientSocket.id);
     console.log(`❌ [${shortId}] Desconectado`);
   });
 });
@@ -282,5 +307,5 @@ app.get("/status", (req, res) =>
 );
 
 app.get("/", (req, res) =>
-  res.json({ message: "Proxy BullEx Definitivo ✅", status: "ok", connections: connections.size })
+  res.json({ message: "Proxy BullEx Saldo Real ✅", status: "ok", connections: connections.size })
 );
