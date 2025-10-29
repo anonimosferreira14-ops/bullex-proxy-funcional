@@ -86,7 +86,8 @@ class EventAggregator {
 
 // ====== CONEXÃO COM BULLEX ======
 function connectToBullEx(ssid, clientSocket) {
-  console.log(`📌 [${clientSocket.id.substring(0, 8)}] Iniciando autenticação com BullEx...`);
+  const shortId = clientSocket.id.substring(0, 8);
+  console.log(`📌 [${shortId}] Iniciando autenticação com BullEx...`);
 
   const bullexWs = new WebSocket("wss://ws.trade.bull-ex.com/echo/websocket", {
     headers: {
@@ -99,11 +100,12 @@ function connectToBullEx(ssid, clientSocket) {
   let reconnectAttempts = 0;
   const maxReconnectAttempts = 5;
   let pingInterval = null;
+  let isAuthenticated = false;
 
   const silentEvents = ["ping", "pong", "timeSync"];
 
   bullexWs.on("open", () => {
-    console.log(`✅ [${clientSocket.id.substring(0, 8)}] Conectado à BullEx. Enviando autenticação...`);
+    console.log(`✅ [${shortId}] Conectado à BullEx. Enviando autenticação...`);
     reconnectAttempts = 0;
 
     bullexWs.send(
@@ -126,17 +128,43 @@ function connectToBullEx(ssid, clientSocket) {
       const event = data.name || "unknown";
 
       if (!silentEvents.includes(event)) {
-        console.log(`📨 [${clientSocket.id.substring(0, 8)}] Evento recebido: ${event}`);
+        console.log(`📨 [${shortId}] Evento: ${event}`);
       }
 
       switch (event) {
         case "authenticated":
-          console.log(`🎯 [${clientSocket.id.substring(0, 8)}] Autenticado com sucesso!`);
+          console.log(`🎯 [${shortId}] Autenticado com sucesso!`);
+          isAuthenticated = true;
           clientSocket.emit("authenticated", data);
+
+          // 🔥 SINCRONIZAR PERFIL E SALDO AUTOMATICAMENTE
+          console.log(`📡 [${shortId}] Solicitando sincronização de dados...`);
+          
+          setTimeout(() => {
+            bullexWs.send(
+              JSON.stringify({
+                name: "profile",
+                msg: {
+                  request_id: `sync-profile-${Date.now()}`,
+                  local_time: Date.now(),
+                },
+              })
+            );
+
+            bullexWs.send(
+              JSON.stringify({
+                name: "get-balances",
+                msg: {
+                  request_id: `sync-balance-${Date.now()}`,
+                  local_time: Date.now(),
+                },
+              })
+            );
+          }, 500);
           break;
 
         case "unauthorized":
-          console.warn(`🚫 [${clientSocket.id.substring(0, 8)}] SSID inválido.`);
+          console.warn(`🚫 [${shortId}] SSID inválido.`);
           clientSocket.emit("unauthorized", data);
           break;
 
@@ -144,52 +172,89 @@ function connectToBullEx(ssid, clientSocket) {
           bullexWs.send(JSON.stringify({ name: "pong" }));
           break;
 
+        // ====== EVENTOS DE PERFIL E SALDO ======
+        case "profile":
+          console.log(`👤 [${shortId}] Perfil recebido`);
+          clientSocket.emit("profile", data);
+          break;
+
+        case "get-balances":
+          console.log(`💰 [${shortId}] Saldos recebidos`);
+          clientSocket.emit("balances", data);
+          break;
+
+        // ====== HIGH-FREQUENCY EVENTS (agregados) ======
         case "candles-generated":
-          if (aggregator.aggregate(event, data)) aggregator.sendAggregated(clientSocket, "candles", data);
+          if (aggregator.aggregate(event, data)) {
+            aggregator.sendAggregated(clientSocket, "candles", data);
+          }
           break;
 
         case "price-splitter.client-buyback-generated":
-          if (aggregator.aggregate(event, data)) aggregator.sendAggregated(clientSocket, "pressure", data);
+          if (aggregator.aggregate(event, data)) {
+            aggregator.sendAggregated(clientSocket, "pressure", data);
+          }
           break;
 
         case "positions-state":
-          if (aggregator.aggregate(event, data)) aggregator.sendAggregated(clientSocket, "positions", data);
+          if (aggregator.aggregate(event, data)) {
+            aggregator.sendAggregated(clientSocket, "positions", data);
+          }
           break;
 
+        // ====== EVENTOS CRÍTICOS (imediatos) ======
         case "balance-changed":
+          console.log(`💵 [${shortId}] Saldo alterado`);
           clientSocket.emit("balance", data);
           break;
 
         case "position-changed":
+          const status = data.msg?.status;
+          const result = data.msg?.result;
+          if (status === "closed") {
+            console.log(`${result === "win" ? "✅" : "❌"} [${shortId}] Posição ${result}`);
+          }
           clientSocket.emit("position-changed", data);
           break;
 
+        case "front":
+          console.log(`🔄 [${shortId}] Evento 'front' recebido`);
+          clientSocket.emit("front", data);
+          break;
+
+        case "result":
+          console.log(`📊 [${shortId}] Resultado recebido`);
+          clientSocket.emit("result", data);
+          break;
+
         default:
+          // Reemitir outros eventos
           clientSocket.emit(event, data);
           break;
       }
     } catch (err) {
-      console.error(`⚠️ Erro parseando mensagem: ${err.message}`);
+      console.error(`⚠️ [${shortId}] Erro parseando mensagem: ${err.message}`);
     }
   });
 
   bullexWs.on("close", () => {
-    console.warn(`🔴 [${clientSocket.id.substring(0, 8)}] Conexão BullEx encerrada.`);
+    console.warn(`🔴 [${shortId}] Conexão BullEx encerrada.`);
     if (pingInterval) clearInterval(pingInterval);
     aggregator.clear();
     clientSocket.emit("disconnected");
 
     if (reconnectAttempts < maxReconnectAttempts && clientSocket.connected) {
       reconnectAttempts++;
-      console.log(`🔄 Tentando reconectar (${reconnectAttempts}/${maxReconnectAttempts})...`);
+      console.log(`🔄 [${shortId}] Reconectando (${reconnectAttempts}/${maxReconnectAttempts})...`);
       setTimeout(() => connectToBullEx(ssid, clientSocket), 4000);
-    } else {
+    } else if (reconnectAttempts >= maxReconnectAttempts) {
+      console.error(`❌ [${shortId}] Máximo de reconexões atingido`);
       clientSocket.emit("error", { message: "Falha de conexão permanente" });
     }
   });
 
   bullexWs.on("error", (err) => {
-    console.error(`⚠️ Erro BullEx: ${err.message}`);
+    console.error(`⚠️ [${shortId}] Erro BullEx: ${err.message}`);
     clientSocket.emit("error", { message: err.message });
   });
 
@@ -198,10 +263,12 @@ function connectToBullEx(ssid, clientSocket) {
 
 // ====== SOCKET.IO ======
 io.on("connection", (clientSocket) => {
-  console.log(`✅ Cliente conectado: ${clientSocket.id.substring(0, 8)}`);
+  const shortId = clientSocket.id.substring(0, 8);
+  console.log(`✅ Cliente conectado: ${shortId}`);
 
   clientSocket.on("authenticate", ({ ssid }) => {
     if (!ssid) {
+      console.warn(`⚠️ [${shortId}] SSID não fornecido`);
       clientSocket.emit("error", { message: "SSID não fornecido" });
       return;
     }
@@ -211,8 +278,10 @@ io.on("connection", (clientSocket) => {
   clientSocket.on("sendMessage", (data) => {
     const connection = connections.get(clientSocket.id);
     if (connection && connection.ws.readyState === WebSocket.OPEN) {
+      console.log(`📤 [${shortId}] Reenviando: ${data.msg?.name || "message"}`);
       connection.ws.send(JSON.stringify(data.msg || data));
     } else {
+      console.warn(`⚠️ [${shortId}] WebSocket não conectado`);
       clientSocket.emit("error", { message: "WebSocket não conectado" });
     }
   });
@@ -224,7 +293,7 @@ io.on("connection", (clientSocket) => {
       connection.aggregator.clear();
       connections.delete(clientSocket.id);
     }
-    console.log(`❌ Cliente desconectado: ${clientSocket.id.substring(0, 8)}`);
+    console.log(`❌ [${shortId}] Desconectado`);
   });
 });
 
@@ -242,5 +311,5 @@ app.get("/status", (req, res) =>
 );
 
 app.get("/", (req, res) =>
-  res.json({ message: "Proxy BullEx Login Corrigido ✅", status: "ok", connections: connections.size })
+  res.json({ message: "Proxy BullEx v3 com Sync Automático ✅", status: "ok", connections: connections.size })
 );
