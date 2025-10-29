@@ -137,26 +137,39 @@ function connectToBullEx(ssid, clientSocket) {
           isAuthenticated = true;
           clientSocket.emit("authenticated", data);
 
-          // 🔥 SINCRONIZAR PERFIL E SALDO AUTOMATICAMENTE
+          // 🔥 ENVIAR SUBSCRIÇÕES PARA RECEBER SALDO E POSIÇÕES
           console.log(`📡 [${shortId}] Solicitando sincronização de dados...`);
           
           setTimeout(() => {
+            // Subscrever aos eventos de saldo
             bullexWs.send(
               JSON.stringify({
-                name: "profile",
+                name: "subscribe",
                 msg: {
-                  request_id: `sync-profile-${Date.now()}`,
-                  local_time: Date.now(),
+                  name: "balance",
+                  version: "1.0",
                 },
               })
             );
 
+            // Subscrever aos eventos de posições
             bullexWs.send(
               JSON.stringify({
-                name: "get-balances",
+                name: "subscribe",
                 msg: {
-                  request_id: `sync-balance-${Date.now()}`,
-                  local_time: Date.now(),
+                  name: "positions",
+                  version: "1.0",
+                },
+              })
+            );
+
+            // Subscrever aos eventos de preços
+            bullexWs.send(
+              JSON.stringify({
+                name: "subscribe",
+                msg: {
+                  name: "pressure",
+                  version: "1.0",
                 },
               })
             );
@@ -204,7 +217,11 @@ function connectToBullEx(ssid, clientSocket) {
 
         // ====== EVENTOS CRÍTICOS (imediatos) ======
         case "balance-changed":
-          console.log(`💵 [${shortId}] Saldo alterado`);
+          const balanceAmount = data?.msg?.current_balance?.amount;
+          if (balanceAmount) {
+            console.log(`💵 [${shortId}] Saldo recebido: ${(balanceAmount / 100).toFixed(2)}`);
+          }
+          clientSocket.emit("balance-changed", data);
           clientSocket.emit("balance", data);
           break;
 
