@@ -17,15 +17,26 @@ const io = new Server(server, {
 });
 
 const connections = new Map();
-const clientBalances = new Map(); // Armazenar saldos por cliente
+const clientBalances = new Map(); // Armazena saldos por cliente
 
 // ====== RATE LIMITING ======
 const RATE_LIMITS = {
+  "candle-generated": { interval: 500, maxEvents: 5 },
   "candles-generated": { interval: 500, maxEvents: 5 },
   "price-splitter.client-buyback-generated": { interval: 1000, maxEvents: 3 },
   "positions-state": { interval: 1000, maxEvents: 10 },
   "balance-changed": { interval: 500, maxEvents: 10 },
 };
+
+// ====== FUNÇÃO DE NORMALIZAÇÃO ======
+function toCents(amount) {
+  if (amount == null) return null;
+  const num = typeof amount === "string" ? Number(amount) : amount;
+  if (Number.isNaN(num)) return null;
+  if (!Number.isInteger(num)) return Math.round(num * 100);
+  if (num > 100000) return num; // já está em centavos
+  return num * 100;
+}
 
 // ====== EVENT AGGREGATOR ======
 class EventAggregator {
@@ -57,7 +68,7 @@ class EventAggregator {
 
   aggregate(eventName, data) {
     if (!this.isWithinRateLimit(eventName)) return false;
-    if (["candles-generated", "price-splitter.client-buyback-generated"].includes(eventName)) {
+    if (["candle-generated", "candles-generated", "price-splitter.client-buyback-generated"].includes(eventName)) {
       this.buffer[eventName] = data;
       return true;
     }
@@ -79,7 +90,7 @@ class EventAggregator {
   }
 }
 
-// ====== CONEXÃO BULLEX ======
+// ====== CONEXÃO BULL-EX ======
 function connectToBullEx(ssid, clientSocket) {
   const shortId = clientSocket.id.substring(0, 8);
   console.log(`📌 [${shortId}] Iniciando autenticação com BullEx...`);
@@ -131,6 +142,21 @@ function connectToBullEx(ssid, clientSocket) {
       if (event === "authenticated") {
         console.log(`🎯 [${shortId}] Autenticado com sucesso!`);
         clientSocket.emit("authenticated", data);
+
+        // Solicita saldo inicial automaticamente
+        setTimeout(() => {
+          try {
+            bullexWs.send(
+              JSON.stringify({
+                name: "sendMessage",
+                msg: { name: "balances.get-balances", version: "1.0", body: {} },
+              })
+            );
+            console.log(`💵 [${shortId}] Pedido de saldo inicial enviado à BullEx`);
+          } catch (e) {
+            console.warn(`⚠️ [${shortId}] Falha ao pedir saldo inicial: ${e.message}`);
+          }
+        }, 600);
         return;
       }
 
@@ -157,27 +183,48 @@ function connectToBullEx(ssid, clientSocket) {
         return;
       }
 
-      // ====== CRÍTICO: Capturar SALDO de balance-changed ======
-      if (event === "balance-changed") {
-        const balanceAmount = data?.msg?.current_balance?.amount;
-        if (balanceAmount) {
-          console.log(`💰 [${shortId}] Saldo capturado: $${(balanceAmount / 100).toFixed(2)}`);
+      // ====== CAPTURA DE SALDO ======
+      if (event === "balance-changed" || event === "balances") {
+        let balanceAmountRaw = null;
+        let currency = "USD";
+        let balanceId = null;
+
+        if (event === "balance-changed") {
+          balanceAmountRaw = data?.msg?.current_balance?.amount;
+          currency = data?.msg?.current_balance?.currency || "USD";
+          balanceId = data?.msg?.current_balance?.id;
+        }
+
+        if (event === "balances" && Array.isArray(data?.msg)) {
+          const usd = data.msg.find((b) => b.currency === "USD") || data.msg[0];
+          if (usd) {
+            balanceAmountRaw = usd.amount;
+            currency = usd.currency || "USD";
+            balanceId = usd.id;
+          }
+        }
+
+        const balanceAmount = toCents(balanceAmountRaw);
+
+        if (balanceAmount != null) {
+          console.log(`💰 [${shortId}] Saldo detectado: ${currency} $${(balanceAmount / 100).toFixed(2)}`);
           clientBalances.set(clientSocket.id, balanceAmount);
-          
-          // Reemitir para cliente
+
+          clientSocket.emit("balance", {
+            msg: { current_balance: { id: balanceId, amount: balanceAmount, currency } },
+          });
+
           clientSocket.emit("balance-changed", data);
-          clientSocket.emit("balance", data);
-          
-          // Também enviar um evento "current-balance" simplificado
           clientSocket.emit("current-balance", {
             amount: balanceAmount,
-            currency: data?.msg?.current_balance?.currency || "USD",
+            currency,
             timestamp: Date.now(),
           });
         }
         return;
       }
 
+      // Posições
       if (event === "position-changed") {
         const status = data.msg?.status;
         const result = data.msg?.result;
@@ -188,9 +235,9 @@ function connectToBullEx(ssid, clientSocket) {
         return;
       }
 
-      // High-frequency events (agregados)
-      if (event === "candles-generated") {
-        if (aggregator.aggregate(event, data)) {
+      // High-frequency events
+      if (event === "candle-generated" || event === "candles-generated") {
+        if (aggregator.aggregate("candle-generated", data)) {
           aggregator.sendAggregated(clientSocket, "candles", data);
         }
         return;
@@ -228,7 +275,7 @@ function connectToBullEx(ssid, clientSocket) {
 
     if (reconnectAttempts < maxReconnectAttempts && clientSocket.connected) {
       reconnectAttempts++;
-      console.log(`🔄 [${shortId}] Reconectando ${reconnectAttempts}/${maxReconnectAttempts}...`);
+      console.log(`🔄 [${shortId}] Tentando reconexão ${reconnectAttempts}/${maxReconnectAttempts}...`);
       setTimeout(() => connectToBullEx(ssid, clientSocket), 4000);
     }
   });
@@ -238,7 +285,7 @@ function connectToBullEx(ssid, clientSocket) {
     clientSocket.emit("error", { message: err.message });
   });
 
-  connections.set(clientSocket.id, { ws: bullexWs, aggregator });
+  connections.set(clientSocket.id, { ws: bullexWs, aggregator, ssid, createdAt: Date.now() });
 }
 
 // ====== SOCKET.IO ======
@@ -265,17 +312,13 @@ io.on("connection", (clientSocket) => {
     }
   });
 
-  // ====== NOVO: Endpoint para pedir saldo atual ======
   clientSocket.on("get-balance", () => {
     const balance = clientBalances.get(clientSocket.id);
     if (balance !== undefined) {
       console.log(`💰 [${shortId}] Enviando saldo: $${(balance / 100).toFixed(2)}`);
       clientSocket.emit("balance", {
         msg: {
-          current_balance: {
-            amount: balance,
-            currency: "USD",
-          },
+          current_balance: { amount: balance, currency: "USD" },
         },
       });
     }
@@ -284,7 +327,9 @@ io.on("connection", (clientSocket) => {
   clientSocket.on("disconnect", () => {
     const connection = connections.get(clientSocket.id);
     if (connection) {
-      connection.ws.close();
+      try {
+        if (connection.ws.readyState === WebSocket.OPEN) connection.ws.close();
+      } catch {}
       connection.aggregator.clear();
       connections.delete(clientSocket.id);
     }
