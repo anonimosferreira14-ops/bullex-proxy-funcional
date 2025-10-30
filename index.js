@@ -1,336 +1,531 @@
-import express from "express";
-import { Server } from "socket.io";
-import cors from "cors";
-import WebSocket from "ws";
+import { useState, useEffect, useRef } from 'react';
+import { useToast } from '@/hooks/use-toast';
+import { io, Socket } from 'socket.io-client';
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const PROXY_URL = "https://bullex-proxy-funcional.onrender.com";
 
-const PORT = process.env.PORT || 10000;
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Proxy BullEx ativo em 0.0.0.0:${PORT}`);
-});
-
-const io = new Server(server, {
-  cors: { origin: "*" },
-  transports: ["websocket", "polling"],
-});
-
-const connections = new Map();
-const clientBalances = new Map();
-
-// ====== RATE LIMITING ======
-const RATE_LIMITS = {
-  "candles-generated": { interval: 500, maxEvents: 5 },
-  "price-splitter.client-buyback-generated": { interval: 1000, maxEvents: 3 },
-  "positions-state": { interval: 1000, maxEvents: 10 },
-  "balance-changed": { interval: 500, maxEvents: 10 },
-};
-
-// ====== EVENT AGGREGATOR ======
-class EventAggregator {
-  constructor(clientId) {
-    this.clientId = clientId;
-    this.buffer = {};
-    this.timers = {};
-    this.rateLimitTrackers = {};
-    Object.keys(RATE_LIMITS).forEach((event) => {
-      this.rateLimitTrackers[event] = { count: 0, resetTime: 0 };
-    });
-  }
-
-  isWithinRateLimit(eventName) {
-    const config = RATE_LIMITS[eventName];
-    if (!config) return true;
-    const now = Date.now();
-    const tracker = this.rateLimitTrackers[eventName];
-    if (now > tracker.resetTime) {
-      tracker.count = 0;
-      tracker.resetTime = now + config.interval;
-    }
-    if (tracker.count < config.maxEvents) {
-      tracker.count++;
-      return true;
-    }
-    return false;
-  }
-
-  aggregate(eventName, data) {
-    if (!this.isWithinRateLimit(eventName)) return false;
-    this.buffer[eventName] = data;
-    return true;
-  }
-
-  sendAggregated(socket, emitNameForClient, data, originalEventName) {
-    if (this.timers[emitNameForClient]) clearTimeout(this.timers[emitNameForClient]);
-    this.timers[emitNameForClient] = setTimeout(() => {
-      socket.emit(emitNameForClient, data);
-      if (originalEventName && originalEventName !== emitNameForClient) {
-        socket.emit(originalEventName, data);
-      }
-      delete this.buffer[emitNameForClient];
-    }, 100);
-  }
-
-  clear() {
-    Object.values(this.timers).forEach(clearTimeout);
-    this.buffer = {};
-    this.timers = {};
-  }
+interface PressureData {
+  call: number[];
+  put: number[];
+  asset_id: number;
+  timestamp: number;
 }
 
-// ====== CONEXÃO BULL-EX ======
-function connectToBullEx(ssid, clientSocket) {
-  const shortId = clientSocket.id.substring(0, 8);
-  console.log(`📌 [${shortId}] Iniciando autenticação com BullEx...`);
-
-  const bullexWs = new WebSocket("wss://ws.trade.bull-ex.com/echo/websocket", {
-    headers: {
-      Origin: "https://trade.bull-ex.com",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    },
-  });
-
-  const aggregator = new EventAggregator(clientSocket.id);
-  let reconnectAttempts = 0;
-  const maxReconnectAttempts = 5;
-  let pingInterval = null;
-  const silentEvents = ["ping", "pong", "timeSync"];
-
-  bullexWs.on("open", () => {
-    console.log(`✅ [${shortId}] Conectado à BullEx. Enviando autenticação...`);
-    reconnectAttempts = 0;
-    bullexWs.send(
-      JSON.stringify({
-        name: "authenticate",
-        msg: { ssid, protocol: 3, client_session_id: "" },
-      })
-    );
-    pingInterval = setInterval(() => {
-      if (bullexWs.readyState === WebSocket.OPEN) {
-        bullexWs.send(JSON.stringify({ name: "ping" }));
-      }
-    }, 20000);
-  });
-
-  bullexWs.on("message", (msg) => {
-    try {
-      const data = JSON.parse(msg.toString());
-      const event = data.name || "unknown";
-      if (!silentEvents.includes(event)) console.log(`📨 [${shortId}] Evento: ${event}`);
-
-      // ====== AUTENTICAÇÃO ======
-      if (event === "authenticated") {
-        console.log(`🎯 [${shortId}] Autenticado com sucesso!`);
-        clientSocket.emit("authenticated", data);
-        return;
-      }
-      if (event === "unauthorized") {
-        console.warn(`🚫 [${shortId}] SSID inválido.`);
-        clientSocket.emit("unauthorized", data);
-        return;
-      }
-
-      // ====== PING/PONG ======
-      if (event === "ping") {
-        bullexWs.send(JSON.stringify({ name: "pong" }));
-        return;
-      }
-      if (event === "pong" || event === "timeSync") return;
-
-      // ====== HANDSHAKE FRONT ======
-      if (event === "front") {
-        console.log(`🔄 [${shortId}] Evento 'front' recebido`);
-        clientSocket.emit("front", data);
-        return;
-      }
-
-      // ====== SALDO ======
-      if (event === "balance-changed" || event === "balances") {
-        const balanceAmount = data?.msg?.current_balance?.amount;
-        if (balanceAmount) {
-          const balanceObj = data?.msg?.current_balance;
-          console.log(`💰 [${shortId}] Saldo detectado: $${(balanceAmount / 100).toFixed(2)}`);
-          clientBalances.set(clientSocket.id, balanceAmount);
-
-          // Salva user_balance_id na conexão para abrir ordens depois
-          if (balanceObj?.id) {
-            const conn = connections.get(clientSocket.id);
-            if (conn) conn.user_balance_id = balanceObj.id;
-          }
-
-          clientSocket.emit("balance-changed", data);
-          clientSocket.emit("balance", data);
-          clientSocket.emit("current-balance", {
-            msg: {
-              current_balance: {
-                amount: balanceAmount,
-                currency: balanceObj?.currency || "USD",
-                timestamp: Date.now(),
-              },
-            },
-          });
-        }
-        return;
-      }
-
-      // ====== ORDENS ======
-      if (event === "position-changed") {
-        const status = data.msg?.status;
-        const result = data.msg?.result;
-        if (status === "closed") {
-          console.log(`${result === "win" ? "✅" : "❌"} [${shortId}] ${result}`);
-        }
-        clientSocket.emit("position-changed", data);
-        return;
-      }
-
-      // ====== CANDLES E OUTROS EVENTOS ======
-      if (event === "candles-generated" || event === "candle-generated") {
-        if (aggregator.aggregate(event, data)) {
-          aggregator.sendAggregated(clientSocket, "candles", data, event);
-        }
-        return;
-      }
-
-      if (event === "price-splitter.client-buyback-generated") {
-        if (aggregator.aggregate(event, data)) {
-          aggregator.sendAggregated(clientSocket, "pressure", data, event);
-        }
-        return;
-      }
-
-      if (event === "positions-state") {
-        if (aggregator.aggregate(event, data)) {
-          aggregator.sendAggregated(clientSocket, "positions", data, event);
-        }
-        return;
-      }
-
-      // ====== REEMITIR GERAL ======
-      clientSocket.emit(event, data);
-    } catch (err) {
-      console.error(`⚠️ [${shortId}] Erro: ${err.message}`);
-    }
-  });
-
-  bullexWs.on("close", () => {
-    console.warn(`🔴 [${shortId}] Conexão encerrada`);
-    if (pingInterval) clearInterval(pingInterval);
-    aggregator.clear();
-    clientBalances.delete(clientSocket.id);
-    clientSocket.emit("disconnected");
-
-    if (reconnectAttempts < maxReconnectAttempts && clientSocket.connected) {
-      reconnectAttempts++;
-      console.log(`🔄 [${shortId}] Reconectando ${reconnectAttempts}/${maxReconnectAttempts}...`);
-      setTimeout(() => connectToBullEx(ssid, clientSocket), 4000);
-    }
-  });
-
-  bullexWs.on("error", (err) => {
-    console.error(`⚠️ [${shortId}] Erro: ${err.message}`);
-    clientSocket.emit("error", { message: err.message });
-  });
-
-  connections.set(clientSocket.id, { ws: bullexWs, aggregator, ssid });
+interface Position {
+  id: string;
+  direction: 'call' | 'put';
+  invest: number;
+  open_price: number;
+  current_price: number;
+  pnl: number;
+  status: 'open' | 'closed';
 }
 
-// ====== SOCKET.IO ======
-io.on("connection", (clientSocket) => {
-  const shortId = clientSocket.id.substring(0, 8);
-  console.log(`✅ Cliente conectado: ${shortId}`);
+interface CandleData {
+  timeframe: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  from: number;
+  to: number;
+}
 
-  clientSocket.on("authenticate", ({ ssid }) => {
-    if (!ssid) return clientSocket.emit("error", { message: "SSID não fornecido" });
-    connectToBullEx(ssid, clientSocket);
-  });
+export const useBullExWebSocket = (ssid: string | null, accountType: 'real' | 'demo' = 'demo') => {
+  const { toast } = useToast();
+  const [isConnected, setIsConnected] = useState(false);
+  const [pressureData, setPressureData] = useState<PressureData | null>(null);
+  const [positions, setPositions] = useState<Position[]>([]);
+  const [candles, setCandles] = useState<Record<number, CandleData>>({});
+  const [balance, setBalance] = useState(0);
+  const [userProfile, setUserProfile] = useState<any>(null);
+  
+  const socketRef = useRef<Socket | null>(null);
 
-  clientSocket.on("sendMessage", (envelope) => {
-    const connection = connections.get(clientSocket.id);
-    if (!connection || connection.ws.readyState !== WebSocket.OPEN) {
-      clientSocket.emit("error", { message: "WebSocket não conectado" });
+  useEffect(() => {
+    if (!ssid) {
+      console.log('⏸️ Aguardando SSID para conectar...');
       return;
     }
-    const toSend = envelope.msg ? envelope.msg : envelope;
-    connection.ws.send(JSON.stringify(toSend));
-    console.log(`📤 [${shortId}] Reenviando: ${toSend.name || toSend.msg?.name || "message"}`);
-  });
 
-  clientSocket.on("get-balance", () => {
-    const balance = clientBalances.get(clientSocket.id);
-    if (balance !== undefined) {
-      clientSocket.emit("balance", {
-        msg: { current_balance: { amount: balance, currency: "USD" } },
+    console.log('🔗 SSID RECEBIDO! Iniciando conexão ao Proxy Render...');
+    console.log('📍 URL do Proxy:', PROXY_URL);
+    console.log('🔑 SSID a ser enviado:', ssid.substring(0, 15) + '...');
+    console.log('🔑 Tamanho do SSID:', ssid.length, 'caracteres');
+    
+    const socket = io(PROXY_URL, {
+      transports: ['websocket'],
+      reconnection: true,
+      reconnectionDelay: 3000,
+      reconnectionAttempts: Infinity,
+      timeout: 20000,
+      forceNew: true
+    });
+    
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      console.log('🔗 Conectado ao Proxy Render - Socket ID:', socket.id);
+      console.log('📤 Enviando authenticate com SSID e tipo de conta...');
+      console.log('🔑 SSID:', ssid.substring(0, 15) + '...');
+      console.log('💼 Tipo de conta:', accountType.toUpperCase());
+      socket.emit('authenticate', { ssid, accountType });
+    });
+
+    // 🔴 DEBUG: Ver TODOS os eventos que chegam
+    socket.onAny((eventName: string, ...args: any[]) => {
+      console.error(`🔴 [TODOS OS EVENTOS] Recebido: ${eventName}`, args);
+    });
+
+    socket.on('authenticated', (data: any) => {
+      console.error("🔴 [AUTHENTICATED] Dados:", data);
+      console.log('🎯 Sessão BullEx autenticada com sucesso!', data);
+      setIsConnected(true);
+      
+      toast({
+        title: "🎯 Conectado à BullEx",
+        description: "Autenticado com sucesso via Proxy Render",
       });
-    }
-  });
+      
+      console.log('📥 Solicitando perfil do usuário...');
+      requestProfile();
+      console.log('📡 Inscrevendo em canais de dados...');
+      subscribeToChannels();
+    });
 
-  clientSocket.on("disconnect", () => {
-    const conn = connections.get(clientSocket.id);
-    if (conn) {
-      conn.ws.close();
-      conn.aggregator.clear();
-      connections.delete(clientSocket.id);
-    }
-    clientBalances.delete(clientSocket.id);
-    console.log(`❌ [${shortId}] Desconectado`);
-  });
-});
+    socket.on("front", (data: any) => {
+      console.error("🔴 [FRONT] Dados:", data);
+    });
 
-// ====== ENDPOINT PARA ABRIR ORDENS ======
-app.post("/open", (req, res) => {
-  const { socketId, ssid, direction, stake, activeId, timeframe = "M1", customSeconds = 5 } = req.body;
-  let connEntry = socketId ? connections.get(socketId) : Array.from(connections.values()).find((c) => c.ssid === ssid);
+    // ===== BALANCE CORRIGIDO! =====
+    socket.on("balance", (data: any) => {
+      console.log("💰 balance recebido:", data);
+      
+      // Formato 1: { msg: { current_balance: { amount: X } } }
+      if (data.msg?.current_balance?.amount) {
+        const amount = data.msg.current_balance.amount / 100;
+        setBalance(amount);
+        
+        if (data.msg.current_balance.id) {
+          setUserProfile((prev: any) => ({ 
+            ...prev, 
+            balance_id: data.msg.current_balance.id 
+          }));
+        }
+        
+        console.log(`💰 Saldo: $${amount.toFixed(2)}`);
+        toast({
+          title: "✅ Conectado!",
+          description: `Saldo sincronizado: $${amount.toFixed(2)}`,
+        });
+        return;
+      }
+      
+      // Formato 2: [ { id: X, amount: Y, currency: "USD" } ]
+      if (Array.isArray(data.msg)) {
+        const usdBalance = data.msg.find((b: any) => b.currency === 'USD');
+        if (usdBalance) {
+          setBalance(usdBalance.amount);
+          setUserProfile((prev: any) => ({ 
+            ...prev, 
+            balance_id: usdBalance.id 
+          }));
+          console.log(`💰 Saldo: $${usdBalance.amount.toFixed(2)}`);
+        }
+        return;
+      }
 
-  if (!connEntry || !connEntry.ws || connEntry.ws.readyState !== WebSocket.OPEN)
-    return res.status(400).json({ ok: false, error: "Conexão não encontrada/aberta" });
+      // Formato 3: { amount: X }
+      if (data.amount !== undefined) {
+        setBalance(data.amount / 100);
+        console.log(`💰 Saldo: $${(data.amount / 100).toFixed(2)}`);
+      }
+    });
 
-  const now = Math.floor(Date.now() / 1000);
-  let optionTypeId = 3, expired = now + customSeconds;
-  if (timeframe === "M1") expired = Math.ceil(now / 60) * 60;
-  if (timeframe === "M5") expired = Math.ceil(now / 300) * 300;
+    // Captura todas as mensagens BullEx repassadas pelo proxy
+    socket.on('bullex_message', (msg: any) => {
+      console.log('📡 [BULLEX_MESSAGE]', msg?.name || 'sem nome');
 
-  const user_balance_id = connEntry.user_balance_id;
-  if (!user_balance_id) return res.status(400).json({ ok: false, error: "user_balance_id ausente" });
+      // Fallback caso BullEx envie authenticated dentro de bullex_message
+      if (msg?.name === 'authenticated') {
+        console.log('🎯 Autenticação confirmada via bullex_message');
+        setIsConnected(true);
+        toast({
+          title: "🎯 Conectado à BullEx",
+          description: "Sessão autenticada (via bullex_message)",
+        });
+      }
 
-  const payload = {
-    name: "binary-options.open-option",
-    version: "2.0",
-    body: {
-      user_balance_id,
-      active_id: activeId,
-      option_type_id: optionTypeId,
-      direction,
-      expired,
-      price: Math.round(stake * 100),
-      value: Math.round(stake * 100),
-      profit_percent: 88,
-      refund_value: 0,
-    },
+      // Rotear mensagens para handlers apropriados
+      switch (msg?.name) {
+        case 'profile':
+          handleProfile(msg);
+          break;
+        case 'client-buyback-generated':
+          handlePressure(msg);
+          break;
+        case 'candles-generated':
+        case 'candles':
+          handleCandles(msg);
+          break;
+        case 'positions-state':
+        case 'positions':
+          handlePositionsState(msg);
+          break;
+        case 'position-changed':
+          handlePositionChanged(msg);
+          break;
+        case 'balance-changed':
+          handleBalanceChanged(msg);
+          break;
+      }
+    });
+
+    socket.on('unauthorized', (data: any) => {
+      console.error('🚫 SSID inválido ou expirado:', data);
+      setIsConnected(false);
+      toast({
+        title: "🚫 SSID inválido",
+        description: "Sessão expirada. Faça login novamente.",
+        variant: "destructive",
+      });
+    });
+
+    socket.on('disconnect', (reason: string) => {
+      console.warn('🔴 Desconectado do Proxy Render. Motivo:', reason);
+      setIsConnected(false);
+      toast({
+        title: "🔴 Desconectado",
+        description: `Conexão perdida: ${reason}`,
+        variant: "destructive",
+      });
+    });
+
+    socket.on('connect_error', (error: any) => {
+      console.error('🚫 Erro de conexão ao Proxy Render:', error?.message || error);
+      setIsConnected(false);
+      toast({
+        title: "🚫 Falha na conexão",
+        description: "Não foi possível conectar ao Proxy Render",
+        variant: "destructive",
+      });
+    });
+
+    socket.on('error', (error: any) => {
+      console.error('🔴 [SOCKET ERROR]', error);
+      console.error('⚠️ Erro no socket:', error?.message || error);
+      setIsConnected(false);
+      toast({
+        title: "⚠️ Erro no canal",
+        description: "Erro na comunicação com o Proxy Render",
+        variant: "destructive",
+      });
+    });
+
+    // Listen to all message types from BullEx via Proxy
+    socket.on('profile', (data: any) => {
+      console.log('👤 Perfil recebido do Proxy:', data);
+      handleProfile(data);
+    });
+    
+    socket.on('client-buyback-generated', (data: any) => {
+      console.log('📊 Pressão recebida do Proxy');
+      handlePressure(data);
+    });
+    
+    socket.on('candles-generated', (data: any) => {
+      console.log('🕯️ Candles recebidos do Proxy');
+      handleCandles(data);
+    });
+    
+    socket.on('candles', (data: any) => {
+      console.log('🕯️ Candles (alternativo) recebidos do Proxy');
+      handleCandles(data);
+    });
+    
+    socket.on('positions-state', (data: any) => {
+      console.log('📍 Posições recebidas do Proxy');
+      handlePositionsState(data);
+    });
+    
+    socket.on('positions', (data: any) => {
+      console.log('📍 Posições (alternativo) recebidas do Proxy');
+      handlePositionsState(data);
+    });
+    
+    socket.on('position-changed', (data: any) => {
+      console.log('🔄 Mudança de posição via Proxy:', data.status);
+      handlePositionChanged(data);
+    });
+    
+    socket.on('balance-changed', (data: any) => {
+      console.log('💰 Saldo alterado via Proxy');
+      handleBalanceChanged(data);
+    });
+
+    return () => {
+      if (socketRef.current) {
+        console.log('🔌 Desconectando socket...');
+        socketRef.current.disconnect();
+      }
+    };
+  }, [ssid, accountType]);
+
+  const requestProfile = () => {
+    socketRef.current?.emit('sendMessage', {
+      name: 'sendMessage',
+      msg: {
+        name: 'balances.get-balances',
+        version: '1.0',
+        body: {}
+      }
+    });
   };
 
-  try {
-    connEntry.ws.send(JSON.stringify(payload));
-    console.log(`🎯 Ordem enviada para BullEx: ${direction} ${activeId} $${stake}`);
-    return res.json({ ok: true, sent: payload });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
+  const subscribeToChannels = () => {
+    const currentAssetId = 76; // EURUSD-OTC
 
-// ====== HEALTHCHECK ======
-app.get("/health", (req, res) =>
-  res.json({ status: "ok", connections: connections.size, timestamp: new Date().toISOString() })
-);
-app.get("/status", (req, res) =>
-  res.json({
-    uptime: process.uptime(),
-    connections: connections.size,
-    memory: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`,
-  })
-);
-app.get("/", (req, res) =>
-  res.json({ message: "Proxy BullEx Saldo Real ✅", status: "ok", connections: connections.size })
-);
+    // Subscribe pressão
+    socketRef.current?.emit('subscribeMessage', {
+      name: 'subscribeMessage',
+      msg: {
+        name: 'price-splitter.client-buyback-generated',
+        version: '1.0',
+        params: {
+          routingFilters: {
+            asset_id: currentAssetId,
+            instrument_type: 'turbo-option',
+            user_group_id: 274
+          }
+        }
+      }
+    });
+
+    // ===== SUBSCRIBE CANDLES CORRIGIDO! =====
+    socketRef.current?.emit('subscribeMessage', {
+      name: 'subscribeMessage',
+      msg: {
+        name: 'candles-generated',
+        version: '1.0',
+        params: {
+          routingFilters: {
+            active_id: currentAssetId
+          }
+        }
+      }
+    });
+
+    // Subscribe posições
+    socketRef.current?.emit('sendMessage', {
+      name: 'sendMessage',
+      msg: {
+        name: 'subscribe-positions',
+        version: '1.0',
+        body: {
+          frequency: 'frequent',
+          ids: []
+        }
+      }
+    });
+
+    console.log('✅ Canais assinados (Pressão + Candles + Posições)');
+  };
+
+  const handleProfile = (data: any) => {
+    const profile = data.msg?.result || data.result || data;
+    const accountType = profile.demo === 1 ? 'DEMO' : 'REAL';
+    
+    setUserProfile({
+      id: profile.user_id,
+      email: profile.email,
+      name: profile.name,
+      balance: (profile.balance || 0) / 100,
+      currency: profile.currency,
+      balance_id: profile.balance_id,
+      accountType: accountType,
+      demo: profile.demo
+    });
+    
+    if (profile.balance) {
+      setBalance(profile.balance / 100);
+    }
+    
+    console.log(`👤 Perfil carregado - Conta: ${accountType}`);
+    console.log(`💰 Saldo ${accountType}: $${((profile.balance || 0) / 100).toFixed(2)}`);
+    
+    toast({
+      title: `Perfil carregado - Conta ${accountType}`,
+      description: `Bem-vindo, ${profile.first_name || profile.name}! Saldo: $${((profile.balance || 0) / 100).toFixed(2)}`,
+    });
+  };
+
+  const handlePressure = (data: any) => {
+    const msgData = data.msg || data;
+    
+    setPressureData({
+      call: msgData.call,
+      put: msgData.put,
+      asset_id: msgData.asset_id,
+      timestamp: Date.now()
+    });
+  };
+
+  const handleCandles = (data: any) => {
+    const msgData = data.msg || data;
+    const candlesData = msgData.candles;
+    
+    if (!candlesData) return;
+    
+    const updatedCandles: Record<number, CandleData> = {};
+    
+    Object.keys(candlesData).forEach(tf => {
+      const timeframe = parseInt(tf);
+      const candle = candlesData[tf];
+      updatedCandles[timeframe] = {
+        timeframe,
+        open: candle.open,
+        high: candle.max,
+        low: candle.min,
+        close: msgData.value || candle.close,
+        from: candle.from,
+        to: candle.to
+      };
+    });
+    
+    setCandles(updatedCandles);
+    console.log('🕯️ Candles atualizados:', Object.keys(updatedCandles).length, 'timeframes');
+  };
+
+  const handlePositionsState = (data: any) => {
+    const msgData = data.msg || data;
+    if (!msgData.positions) return;
+    
+    const updatedPositions = msgData.positions.map((pos: any) => ({
+      id: pos.id,
+      direction: pos.direction as 'call' | 'put',
+      invest: pos.margin || pos.invest,
+      open_price: pos.open_price,
+      current_price: pos.current_price,
+      pnl: pos.pnl,
+      status: 'open' as const
+    }));
+    setPositions(updatedPositions);
+  };
+
+  const handlePositionChanged = (data: any) => {
+    const msgData = data.msg || data;
+    if (msgData.status !== 'closed') return;
+    
+    const result = msgData.close_reason;
+    const pnl = msgData.pnl_realized / 100;
+    const direction = msgData.raw_event?.binary_options_option_changed1?.direction || 'unknown';
+    
+    console.log(`${result === 'win' ? '✅ WIN' : '❌ LOSS'}: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USD`);
+    
+    // Adicionar ao histórico
+    if ((window as any).tradingHistory) {
+      (window as any).tradingHistory.push({
+        result: result === 'win' ? 'WIN' : 'LOSS',
+        profit: pnl,
+        direction: direction,
+        timestamp: Date.now()
+      });
+    }
+    
+    toast({
+      title: result === 'win' ? '🎉 WIN!' : '❌ LOSS',
+      description: `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`,
+      variant: result === 'win' ? 'default' : 'destructive',
+    });
+    
+    setPositions(prev => prev.filter(p => p.id !== msgData.id));
+  };
+
+  // ===== BALANCE CHANGE CORRIGIDO! =====
+  const handleBalanceChanged = (data: any) => {
+    const msgData = data.msg || data;
+    
+    if (msgData.current_balance?.amount) {
+      const newBalance = msgData.current_balance.amount / 100;
+      setBalance(newBalance);
+      console.log(`💰 Saldo atualizado: $${newBalance.toFixed(2)}`);
+    }
+  };
+
+  // ===== OPEN POSITION CORRIGIDO! =====
+  const openPosition = (direction: 'call' | 'put', amount: number, assetId: number = 76, duration: number = 60) => {
+    if (!isConnected || !socketRef.current) {
+      toast({
+        title: "❌ Não conectado",
+        description: "Conecte-se primeiro para operar",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!userProfile?.balance_id) {
+      toast({
+        title: "❌ Balance ID não disponível",
+        description: "Aguarde o carregamento do perfil",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const expiration = now + duration;
+    const valueInCents = Math.floor(amount * 100);
+
+    console.log('📤 Enviando ordem:', {
+      direction,
+      amount,
+      assetId,
+      duration,
+      balance_id: userProfile.balance_id
+    });
+
+    // FORMATO CORRETO DA BULLEX
+    socketRef.current.emit('sendMessage', {
+      name: 'sendMessage',
+      msg: {
+        name: 'binary-options.open-option',
+        version: '2.0',
+        body: {
+          user_balance_id: userProfile.balance_id,
+          active_id: assetId,
+          option_type_id: 3, // turbo-option
+          direction: direction,
+          expired: expiration,
+          price: 1,
+          profit_percent: 87,
+          refund_value: 0,
+          value: valueInCents
+        }
+      }
+    });
+
+    console.log(`📤 Ordem ${direction.toUpperCase()} enviada: $${amount} - Ativo: ${assetId}`);
+    
+    toast({
+      title: `${direction === 'call' ? '🟢' : '🔴'} Operação ${direction.toUpperCase()} enviada`,
+      description: `Valor: $${amount} | Duração: ${duration}s`,
+    });
+  };
+
+  return {
+    isConnected,
+    pressureData,
+    positions,
+    candles,
+    balance,
+    userProfile,
+    openPosition
+  };
+};
+
+// Adicionar log para debug
+if (typeof window !== 'undefined') {
+  (window as any).checkConnectionState = () => {
+    console.log('🔍 Estado atual de conexão disponível através do hook');
+  };
+}
