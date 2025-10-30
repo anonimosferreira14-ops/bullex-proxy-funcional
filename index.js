@@ -5,6 +5,7 @@ import WebSocket from "ws";
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, "0.0.0.0", () => {
@@ -17,26 +18,15 @@ const io = new Server(server, {
 });
 
 const connections = new Map();
-const clientBalances = new Map(); // Armazena saldos por cliente
+const clientBalances = new Map();
 
 // ====== RATE LIMITING ======
 const RATE_LIMITS = {
-  "candle-generated": { interval: 500, maxEvents: 5 },
   "candles-generated": { interval: 500, maxEvents: 5 },
   "price-splitter.client-buyback-generated": { interval: 1000, maxEvents: 3 },
   "positions-state": { interval: 1000, maxEvents: 10 },
   "balance-changed": { interval: 500, maxEvents: 10 },
 };
-
-// ====== FUNÇÃO DE NORMALIZAÇÃO ======
-function toCents(amount) {
-  if (amount == null) return null;
-  const num = typeof amount === "string" ? Number(amount) : amount;
-  if (Number.isNaN(num)) return null;
-  if (!Number.isInteger(num)) return Math.round(num * 100);
-  if (num > 100000) return num; // já está em centavos
-  return num * 100;
-}
 
 // ====== EVENT AGGREGATOR ======
 class EventAggregator {
@@ -68,18 +58,18 @@ class EventAggregator {
 
   aggregate(eventName, data) {
     if (!this.isWithinRateLimit(eventName)) return false;
-    if (["candle-generated", "candles-generated", "price-splitter.client-buyback-generated"].includes(eventName)) {
-      this.buffer[eventName] = data;
-      return true;
-    }
+    this.buffer[eventName] = data;
     return true;
   }
 
-  sendAggregated(socket, eventName, data) {
-    if (this.timers[eventName]) clearTimeout(this.timers[eventName]);
-    this.timers[eventName] = setTimeout(() => {
-      socket.emit(eventName, data);
-      delete this.buffer[eventName];
+  sendAggregated(socket, emitNameForClient, data, originalEventName) {
+    if (this.timers[emitNameForClient]) clearTimeout(this.timers[emitNameForClient]);
+    this.timers[emitNameForClient] = setTimeout(() => {
+      socket.emit(emitNameForClient, data);
+      if (originalEventName && originalEventName !== emitNameForClient) {
+        socket.emit(originalEventName, data);
+      }
+      delete this.buffer[emitNameForClient];
     }, 100);
   }
 
@@ -106,20 +96,17 @@ function connectToBullEx(ssid, clientSocket) {
   let reconnectAttempts = 0;
   const maxReconnectAttempts = 5;
   let pingInterval = null;
-
   const silentEvents = ["ping", "pong", "timeSync"];
 
   bullexWs.on("open", () => {
     console.log(`✅ [${shortId}] Conectado à BullEx. Enviando autenticação...`);
     reconnectAttempts = 0;
-
     bullexWs.send(
       JSON.stringify({
         name: "authenticate",
         msg: { ssid, protocol: 3, client_session_id: "" },
       })
     );
-
     pingInterval = setInterval(() => {
       if (bullexWs.readyState === WebSocket.OPEN) {
         bullexWs.send(JSON.stringify({ name: "ping" }));
@@ -131,100 +118,64 @@ function connectToBullEx(ssid, clientSocket) {
     try {
       const data = JSON.parse(msg.toString());
       const event = data.name || "unknown";
+      if (!silentEvents.includes(event)) console.log(`📨 [${shortId}] Evento: ${event}`);
 
-      if (!silentEvents.includes(event)) {
-        console.log(`📨 [${shortId}] Evento: ${event}`);
-      }
-
-      // ====== TRATAMENTO DE EVENTOS ======
-
-      // Autenticação
+      // ====== AUTENTICAÇÃO ======
       if (event === "authenticated") {
         console.log(`🎯 [${shortId}] Autenticado com sucesso!`);
         clientSocket.emit("authenticated", data);
-
-        // Solicita saldo inicial automaticamente
-        setTimeout(() => {
-          try {
-            bullexWs.send(
-              JSON.stringify({
-                name: "sendMessage",
-                msg: { name: "balances.get-balances", version: "1.0", body: {} },
-              })
-            );
-            console.log(`💵 [${shortId}] Pedido de saldo inicial enviado à BullEx`);
-          } catch (e) {
-            console.warn(`⚠️ [${shortId}] Falha ao pedir saldo inicial: ${e.message}`);
-          }
-        }, 600);
         return;
       }
-
       if (event === "unauthorized") {
         console.warn(`🚫 [${shortId}] SSID inválido.`);
         clientSocket.emit("unauthorized", data);
         return;
       }
 
-      // Ping/Pong
+      // ====== PING/PONG ======
       if (event === "ping") {
         bullexWs.send(JSON.stringify({ name: "pong" }));
         return;
       }
+      if (event === "pong" || event === "timeSync") return;
 
-      if (event === "pong" || event === "timeSync") {
-        return;
-      }
-
-      // Front (handshake)
+      // ====== HANDSHAKE FRONT ======
       if (event === "front") {
         console.log(`🔄 [${shortId}] Evento 'front' recebido`);
         clientSocket.emit("front", data);
         return;
       }
 
-      // ====== CAPTURA DE SALDO ======
+      // ====== SALDO ======
       if (event === "balance-changed" || event === "balances") {
-        let balanceAmountRaw = null;
-        let currency = "USD";
-        let balanceId = null;
-
-        if (event === "balance-changed") {
-          balanceAmountRaw = data?.msg?.current_balance?.amount;
-          currency = data?.msg?.current_balance?.currency || "USD";
-          balanceId = data?.msg?.current_balance?.id;
-        }
-
-        if (event === "balances" && Array.isArray(data?.msg)) {
-          const usd = data.msg.find((b) => b.currency === "USD") || data.msg[0];
-          if (usd) {
-            balanceAmountRaw = usd.amount;
-            currency = usd.currency || "USD";
-            balanceId = usd.id;
-          }
-        }
-
-        const balanceAmount = toCents(balanceAmountRaw);
-
-        if (balanceAmount != null) {
-          console.log(`💰 [${shortId}] Saldo detectado: ${currency} $${(balanceAmount / 100).toFixed(2)}`);
+        const balanceAmount = data?.msg?.current_balance?.amount;
+        if (balanceAmount) {
+          const balanceObj = data?.msg?.current_balance;
+          console.log(`💰 [${shortId}] Saldo detectado: $${(balanceAmount / 100).toFixed(2)}`);
           clientBalances.set(clientSocket.id, balanceAmount);
 
-          clientSocket.emit("balance", {
-            msg: { current_balance: { id: balanceId, amount: balanceAmount, currency } },
-          });
+          // Salva user_balance_id na conexão para abrir ordens depois
+          if (balanceObj?.id) {
+            const conn = connections.get(clientSocket.id);
+            if (conn) conn.user_balance_id = balanceObj.id;
+          }
 
           clientSocket.emit("balance-changed", data);
+          clientSocket.emit("balance", data);
           clientSocket.emit("current-balance", {
-            amount: balanceAmount,
-            currency,
-            timestamp: Date.now(),
+            msg: {
+              current_balance: {
+                amount: balanceAmount,
+                currency: balanceObj?.currency || "USD",
+                timestamp: Date.now(),
+              },
+            },
           });
         }
         return;
       }
 
-      // Posições
+      // ====== ORDENS ======
       if (event === "position-changed") {
         const status = data.msg?.status;
         const result = data.msg?.result;
@@ -235,32 +186,30 @@ function connectToBullEx(ssid, clientSocket) {
         return;
       }
 
-      // High-frequency events
-      if (event === "candle-generated" || event === "candles-generated") {
-        if (aggregator.aggregate("candle-generated", data)) {
-          aggregator.sendAggregated(clientSocket, "candles", data);
+      // ====== CANDLES E OUTROS EVENTOS ======
+      if (event === "candles-generated" || event === "candle-generated") {
+        if (aggregator.aggregate(event, data)) {
+          aggregator.sendAggregated(clientSocket, "candles", data, event);
         }
         return;
       }
 
       if (event === "price-splitter.client-buyback-generated") {
         if (aggregator.aggregate(event, data)) {
-          aggregator.sendAggregated(clientSocket, "pressure", data);
+          aggregator.sendAggregated(clientSocket, "pressure", data, event);
         }
         return;
       }
 
       if (event === "positions-state") {
         if (aggregator.aggregate(event, data)) {
-          aggregator.sendAggregated(clientSocket, "positions", data);
+          aggregator.sendAggregated(clientSocket, "positions", data, event);
         }
         return;
       }
 
-      // ====== REEMITIR TUDO MAIS ======
-      console.log(`📤 [${shortId}] Reemitindo: ${event}`);
+      // ====== REEMITIR GERAL ======
       clientSocket.emit(event, data);
-
     } catch (err) {
       console.error(`⚠️ [${shortId}] Erro: ${err.message}`);
     }
@@ -275,7 +224,7 @@ function connectToBullEx(ssid, clientSocket) {
 
     if (reconnectAttempts < maxReconnectAttempts && clientSocket.connected) {
       reconnectAttempts++;
-      console.log(`🔄 [${shortId}] Tentando reconexão ${reconnectAttempts}/${maxReconnectAttempts}...`);
+      console.log(`🔄 [${shortId}] Reconectando ${reconnectAttempts}/${maxReconnectAttempts}...`);
       setTimeout(() => connectToBullEx(ssid, clientSocket), 4000);
     }
   });
@@ -285,7 +234,7 @@ function connectToBullEx(ssid, clientSocket) {
     clientSocket.emit("error", { message: err.message });
   });
 
-  connections.set(clientSocket.id, { ws: bullexWs, aggregator, ssid, createdAt: Date.now() });
+  connections.set(clientSocket.id, { ws: bullexWs, aggregator, ssid });
 }
 
 // ====== SOCKET.IO ======
@@ -294,43 +243,35 @@ io.on("connection", (clientSocket) => {
   console.log(`✅ Cliente conectado: ${shortId}`);
 
   clientSocket.on("authenticate", ({ ssid }) => {
-    if (!ssid) {
-      clientSocket.emit("error", { message: "SSID não fornecido" });
-      return;
-    }
+    if (!ssid) return clientSocket.emit("error", { message: "SSID não fornecido" });
     connectToBullEx(ssid, clientSocket);
   });
 
-  clientSocket.on("sendMessage", (data) => {
+  clientSocket.on("sendMessage", (envelope) => {
     const connection = connections.get(clientSocket.id);
-    if (connection && connection.ws.readyState === WebSocket.OPEN) {
-      console.log(`📤 [${shortId}] Reenviando: ${data.msg?.name || "message"}`);
-      connection.ws.send(JSON.stringify(data.msg || data));
-    } else {
-      console.warn(`⚠️ [${shortId}] WebSocket não conectado`);
+    if (!connection || connection.ws.readyState !== WebSocket.OPEN) {
       clientSocket.emit("error", { message: "WebSocket não conectado" });
+      return;
     }
+    const toSend = envelope.msg ? envelope.msg : envelope;
+    connection.ws.send(JSON.stringify(toSend));
+    console.log(`📤 [${shortId}] Reenviando: ${toSend.name || toSend.msg?.name || "message"}`);
   });
 
   clientSocket.on("get-balance", () => {
     const balance = clientBalances.get(clientSocket.id);
     if (balance !== undefined) {
-      console.log(`💰 [${shortId}] Enviando saldo: $${(balance / 100).toFixed(2)}`);
       clientSocket.emit("balance", {
-        msg: {
-          current_balance: { amount: balance, currency: "USD" },
-        },
+        msg: { current_balance: { amount: balance, currency: "USD" } },
       });
     }
   });
 
   clientSocket.on("disconnect", () => {
-    const connection = connections.get(clientSocket.id);
-    if (connection) {
-      try {
-        if (connection.ws.readyState === WebSocket.OPEN) connection.ws.close();
-      } catch {}
-      connection.aggregator.clear();
+    const conn = connections.get(clientSocket.id);
+    if (conn) {
+      conn.ws.close();
+      conn.aggregator.clear();
       connections.delete(clientSocket.id);
     }
     clientBalances.delete(clientSocket.id);
@@ -338,11 +279,51 @@ io.on("connection", (clientSocket) => {
   });
 });
 
-// ====== ENDPOINTS ======
+// ====== ENDPOINT PARA ABRIR ORDENS ======
+app.post("/open", (req, res) => {
+  const { socketId, ssid, direction, stake, activeId, timeframe = "M1", customSeconds = 5 } = req.body;
+  let connEntry = socketId ? connections.get(socketId) : Array.from(connections.values()).find((c) => c.ssid === ssid);
+
+  if (!connEntry || !connEntry.ws || connEntry.ws.readyState !== WebSocket.OPEN)
+    return res.status(400).json({ ok: false, error: "Conexão não encontrada/aberta" });
+
+  const now = Math.floor(Date.now() / 1000);
+  let optionTypeId = 3, expired = now + customSeconds;
+  if (timeframe === "M1") expired = Math.ceil(now / 60) * 60;
+  if (timeframe === "M5") expired = Math.ceil(now / 300) * 300;
+
+  const user_balance_id = connEntry.user_balance_id;
+  if (!user_balance_id) return res.status(400).json({ ok: false, error: "user_balance_id ausente" });
+
+  const payload = {
+    name: "binary-options.open-option",
+    version: "2.0",
+    body: {
+      user_balance_id,
+      active_id: activeId,
+      option_type_id: optionTypeId,
+      direction,
+      expired,
+      price: Math.round(stake * 100),
+      value: Math.round(stake * 100),
+      profit_percent: 88,
+      refund_value: 0,
+    },
+  };
+
+  try {
+    connEntry.ws.send(JSON.stringify(payload));
+    console.log(`🎯 Ordem enviada para BullEx: ${direction} ${activeId} $${stake}`);
+    return res.json({ ok: true, sent: payload });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ====== HEALTHCHECK ======
 app.get("/health", (req, res) =>
   res.json({ status: "ok", connections: connections.size, timestamp: new Date().toISOString() })
 );
-
 app.get("/status", (req, res) =>
   res.json({
     uptime: process.uptime(),
@@ -350,7 +331,6 @@ app.get("/status", (req, res) =>
     memory: `${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`,
   })
 );
-
 app.get("/", (req, res) =>
   res.json({ message: "Proxy BullEx Saldo Real ✅", status: "ok", connections: connections.size })
 );
