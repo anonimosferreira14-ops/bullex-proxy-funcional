@@ -610,6 +610,9 @@ function connectToBullEx(ssid, accountType, clientSocket) {
 // ------------------- Socket.IO server -------------------
 io.on("connection", (socket) => {
   console.log(`✅ Cliente Socket.IO conectado: ${socket.id}`);
+    socket.onAny((event, data) => {
+    console.log(`[${socket.id.slice(0,8)}] 🔍 Evento recebido do cliente: ${event}`, data);
+  });
 
   // authenticate (correto, recebe accountType)
   socket.on("authenticate", async ({ ssid, accountType }) => {
