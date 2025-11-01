@@ -1,5 +1,5 @@
 /**
- * Proxy BullEx — Versão definitiva (funcional com Lovable)
+ * Proxy BullEx — Versão 3 (Corrigida com base nos logs reais)
  *
  * = Requisitos =
  * package.json deve incluir:
@@ -34,23 +34,29 @@ const io = new SocketIOServer(server, {
 });
 
 // ------------------- Helpers / Mappings -------------------
-// Active map (common OTC & BLITZ) - extend if needed
+
+// =================================================================
+// CORREÇÃO 1: ACTIVE_MAP atualizado com base nos seus logs [cite: 492-495, 514-521]
+// =================================================================
 const ACTIVE_MAP = {
+  // Binários (OTC) - IDs de '1 Ativos underlying-list.txt'
   "EURUSD-OTC": 76,
-  "GBPUSD-OTC": 77,
-  "USDJPY-OTC": 78,
-  "AUDUSD-OTC": 79,
-  "EURJPY-OTC": 80,
-  "EURGBP-OTC": 81,
-  "USDCHF-OTC": 82,
-  "USDCAD-OTC": 83,
-  "EURCAD-OTC": 84,
-  "GBPJPY-OTC": 85,
-  "GBPCHF-OTC": 86,
-  "AUDJPY-OTC": 87,
-  "AUDCAD-OTC": 88,
-  "NZDUSD-OTC": 89,
-  // Blitz examples
+  "EURGBP-OTC": 77,
+  "USDCHF-OTC": 78,
+  "EURJPY-OTC": 79,
+  "GBPUSD-OTC": 81,
+  "GBPJPY-OTC": 84,
+  "USDJPY-OTC": 85,
+  "AUDCAD-OTC": 86,
+  "AUDUSD-OTC": 2111,
+  "USDCAD-OTC": 2112,
+  "AUDJPY-OTC": 2113,
+  "EURCAD-OTC": 2117,
+  "NZDUSD-OTC": 89, // (ID 89 não estava no seu log, mantendo do proxy anterior)
+  "EURAUD-OTC": 2120,
+  "GBPCHF-OTC": 2115,
+
+  // Blitz (Digitais) - IDs do proxy anterior (você mencionou em prompts)
   "BTCUSD-BLZ": 201,
   "ETHUSD-BLZ": 202,
   "LTCUSD-BLZ": 203,
@@ -65,7 +71,7 @@ const ACTIVE_MAP = {
 
 // small in-memory stores
 const connections = new Map(); // socketId -> { ws, aggregator, ssid, accountType, user_balance_id, currentActive }
-const clientBalances = new Map(); // socketId -> amount (raw cents or unit as coming)
+const clientBalances = new Map(); // socketId -> amount (em CENTAVOS)
 let globalRequestCounter = 1;
 
 // utility: generate request_id similar to captured logs
@@ -74,16 +80,15 @@ function genRequestId() {
   return `${r}`;
 }
 function localTime() {
-  // matches logs where local_time is small int (client tick); use ms % 1e7
   return Math.floor(Date.now() % 1000000);
 }
 function toCentsMaybe(val) {
   if (val == null) return null;
   const n = Number(val);
   if (Number.isNaN(n)) return null;
-  // If already large integer (likely cents) keep, else multiply
+  // Se já for um inteiro grande (provavelmente centavos), mantenha
   if (Number.isInteger(n) && n > 1000) return n;
-  // assume decimal units -> cents
+  // Se for um float (dólares), converte para centavos
   return Math.round(n * 100);
 }
 
@@ -95,6 +100,7 @@ const authLimiter = rateLimit({
 });
 
 // ------------------- REST: try login and extract SSID -------------------
+// (Esta função permanece a mesma, está correta)
 async function tryRestLogin(email, password) {
   const headers = {
     "Content-Type": "application/json",
@@ -104,7 +110,6 @@ async function tryRestLogin(email, password) {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
     "x-platform-id": "189",
-    // x-device-id can be random, BullEx sometimes expects it
     "x-device-id": crypto.randomUUID(),
   };
 
@@ -117,7 +122,6 @@ async function tryRestLogin(email, password) {
 
     const text = await res.text();
     const rawHeaders = Object.fromEntries(res.headers.entries());
-    // try extract SSID from set-cookie or body
     const cookie = rawHeaders["set-cookie"] || rawHeaders["cookie"] || "";
     const ssid =
       cookie.match(/SSID=([^;]+)/)?.[1] ||
@@ -132,6 +136,7 @@ async function tryRestLogin(email, password) {
 }
 
 // ------------------- Validate SSID via short WS handshake -------------------
+// (Esta função permanece a mesma, está correta)
 async function validateSsidViaWs(ssid, timeoutMs = 7000) {
   return new Promise((resolve) => {
     const ws = new WebSocket(BULL_EX_WS);
@@ -197,6 +202,7 @@ async function validateSsidViaWs(ssid, timeoutMs = 7000) {
 }
 
 // ------------------- REST endpoints -------------------
+// (Estas funções permanecem as mesmas, estão corretas)
 app.get("/", (req, res) =>
   res.json({
     ok: true,
@@ -207,14 +213,6 @@ app.get("/", (req, res) =>
 app.get("/health", (req, res) =>
   res.json({ ok: true, connections: connections.size, ts: Date.now() })
 );
-
-// test endpoint: validate ssid quickly
-app.get("/test/ssid/:ssid", async (req, res) => {
-  const { ssid } = req.params;
-  if (!ssid) return res.status(400).json({ ok: false, error: "ssid required" });
-  const valid = await validateSsidViaWs(ssid, 7000);
-  return res.json(valid);
-});
 
 app.post("/auth/login", authLimiter, async (req, res) => {
   try {
@@ -236,9 +234,7 @@ app.post("/auth/login", authLimiter, async (req, res) => {
 
     const result = await tryRestLogin(email, password);
 
-    // If BullEx returned ssid in headers/body even with 403/401, accept it
     if (result.ssid) {
-      // double-check validity quickly
       const v = await validateSsidViaWs(result.ssid);
       if (v.valid) {
         return res.json({
@@ -248,7 +244,6 @@ app.post("/auth/login", authLimiter, async (req, res) => {
           raw: result,
         });
       } else {
-        // still return it for manual fallback (client can try)
         return res.json({
           success: false,
           ssid: result.ssid,
@@ -258,7 +253,6 @@ app.post("/auth/login", authLimiter, async (req, res) => {
       }
     }
 
-    // no ssid found: return details but not raw HTML
     return res.status(403).json({
       success: false,
       message: "Autenticação via REST falhou. Cole o SSID manualmente.",
@@ -275,6 +269,7 @@ app.post("/auth/login", authLimiter, async (req, res) => {
 });
 
 // ------------------- Aggregator utility -------------------
+// (Esta função permanece a mesma, está correta)
 class SimpleAggregator {
   constructor() {
     this.timers = {};
@@ -293,6 +288,7 @@ class SimpleAggregator {
 }
 
 // ------------------- Core: connectToBullEx per client -------------------
+// (Funções de helper permanecem as mesmas)
 function resolveActivePayload(raw) {
   if (!raw) return null;
   if (typeof raw === "string") return { type: "name", value: raw };
@@ -315,7 +311,6 @@ function resolveActivePayload(raw) {
 
 function sendSubscribeCandles(bullexWs, id, timeframe = "1m") {
   try {
-    // bullEx expects both wrapper and direct variants in some flows
     const wrapper = {
       name: "sendMessage",
       msg: {
@@ -335,9 +330,6 @@ function sendSubscribeCandles(bullexWs, id, timeframe = "1m") {
   } catch (e) {}
 }
 
-// =================================================================
-// CORREÇÃO 1: A função agora aceita `accountType`
-// =================================================================
 function connectToBullEx(ssid, accountType, clientSocket) {
   const short = clientSocket.id.slice(0, 8);
   console.log(`[${short}] connecting to BullEx WS (Account: ${accountType})...`);
@@ -352,14 +344,11 @@ function connectToBullEx(ssid, accountType, clientSocket) {
   let pingInterval = null;
   let reconnectAttempts = 0;
 
-  // =================================================================
-  // CORREÇÃO 1.1: Armazenando o `accountType` na conexão
-  // =================================================================
   connections.set(clientSocket.id, {
     ws: bullexWs,
     aggregator,
     ssid,
-    accountType, // Salva o tipo de conta
+    accountType,
     user_balance_id: null,
     currentActive: null,
   });
@@ -368,6 +357,7 @@ function connectToBullEx(ssid, accountType, clientSocket) {
     console.log(`[${short}] Bullex WS open, authenticating...`);
     reconnectAttempts = 0;
     try {
+      // Autenticação (correta) [cite: 644, 676]
       bullexWs.send(
         JSON.stringify({
           name: "authenticate",
@@ -382,6 +372,58 @@ function connectToBullEx(ssid, accountType, clientSocket) {
           bullexWs.send(JSON.stringify({ name: "ping" }));
         } catch (e) {}
     }, 20000);
+
+    // Após autenticar, pede os dados iniciais
+    setTimeout(() => {
+      try {
+        // Pedido de saldo (correto) [cite: 672, 682]
+        bullexWs.send(
+          JSON.stringify({
+            name: "sendMessage",
+            msg: { name: "balances.get-balances", version: "1.0", body: {} },
+          })
+        );
+        
+        // =================================================================
+        // CORREÇÃO 3: Adicionando subscrição de `balances.balance-changed` 
+        // =================================================================
+        bullexWs.send(
+          JSON.stringify({
+            name: "subscribeMessage",
+            msg: { version: "1.0", name: "balances.balance-changed" },
+            request_id: genRequestId(),
+          })
+        );
+        
+        // =================================================================
+        // CORREÇÃO 4: Adicionando `frequency` ao `subscribe-positions` 
+        // =================================================================
+        bullexWs.send(
+          JSON.stringify({
+            name: "sendMessage",
+            msg: { 
+              name: "subscribe-positions", 
+              version: "1.0", 
+              body: { frequency: "frequent" } // Adicionado
+            },
+          })
+        );
+
+        bullexWs.send(
+          JSON.stringify({
+            name: "sendMessage",
+            msg: { name: "actives.get-all", version: "1.0", body: {} },
+          })
+        );
+        
+        const defaultId = ACTIVE_MAP["EURUSD-OTC"];
+        if (defaultId) sendSubscribeCandles(bullexWs, defaultId, "1m");
+        
+        console.log(
+          `[${short}] Pedido de saldo, subscrição de saldo, positions, actives e candles enviados`
+        );
+      } catch (e) {}
+    }, 600);
   });
 
   bullexWs.on("message", (raw) => {
@@ -394,34 +436,7 @@ function connectToBullEx(ssid, accountType, clientSocket) {
       // AUTH events
       if (event === "authenticated") {
         clientSocket.emit("authenticated", data);
-        // after auth: ask balances, positions, actives, default candles
-        setTimeout(() => {
-          try {
-            bullexWs.send(
-              JSON.stringify({
-                name: "sendMessage",
-                msg: { name: "balances.get-balances", version: "1.0", body: {} },
-              })
-            );
-            bullexWs.send(
-              JSON.stringify({
-                name: "sendMessage",
-                msg: { name: "subscribe-positions", version: "1.0", body: {} },
-              })
-            );
-            bullexWs.send(
-              JSON.stringify({
-                name: "sendMessage",
-                msg: { name: "actives.get-all", version: "1.0", body: {} },
-              })
-            );
-            const defaultId = ACTIVE_MAP["EURUSD-OTC"];
-            if (defaultId) sendSubscribeCandles(bullexWs, defaultId, "1m");
-            console.log(
-              `[${short}] Pedido de saldo, positions, actives e candles enviados`
-            );
-          } catch (e) {}
-        }, 600);
+        // Não precisamos mais pedir saldo aqui, já é feito no open
         return;
       }
       if (event === "unauthorized") {
@@ -430,7 +445,7 @@ function connectToBullEx(ssid, accountType, clientSocket) {
       }
 
       // =================================================================
-      // CORREÇÃO 2: Lógica de Saldo (Real vs Demo)
+      // CORREÇÃO 2: Lógica de Saldo (Recebe DÓLARES, envia CENTAVOS)
       // =================================================================
       if (event === "balances" || event === "balance-changed") {
         const conn = connections.get(clientSocket.id);
@@ -439,6 +454,7 @@ function connectToBullEx(ssid, accountType, clientSocket) {
         let targetBalance = null;
         let balancesArray = [];
 
+        // 'balance-changed' tem um formato [cite: 646], 'balances' tem outro 
         if (event === "balance-changed") {
           if (data?.msg?.current_balance)
             balancesArray = [data.msg.current_balance];
@@ -448,15 +464,14 @@ function connectToBullEx(ssid, accountType, clientSocket) {
 
         if (balancesArray.length > 0) {
           // Lógica para encontrar o saldo correto:
-          // Tipo 1 = Real, Tipo 4 = Demo (Padrão comum nessas plataformas)
-          // Também checa 'is_demo' como fallback.
+          // type: 1 = Real, type: 4 = Demo (Com base nos logs) 
           targetBalance = balancesArray.find(
             (b) =>
-              (requestedType === "demo" && (b.type === 4 || b.is_demo === true)) ||
-              (requestedType === "real" && (b.type === 1 || b.is_demo === false || b.is_demo == null))
+              (requestedType === "demo" && b.type === 4) ||
+              (requestedType === "real" && b.type === 1)
           );
 
-          // Fallback se a lógica de tipo falhar: Tenta pegar o primeiro USD
+          // Fallback se a lógica de tipo falhar
           if (!targetBalance) {
             targetBalance =
               balancesArray.find((b) => b.currency === "USD") || balancesArray[0];
@@ -465,37 +480,40 @@ function connectToBullEx(ssid, accountType, clientSocket) {
         }
         
         if (targetBalance) {
+          // 'amount' VEM COMO FLOAT (DÓLARES) ex: 72295.57 [cite: 682]
           const { amount, currency = "USD", id = null, user_balance_id = null } = targetBalance;
           const final_ubid = id || user_balance_id;
 
-          clientBalances.set(clientSocket.id, amount);
+          // Converte para CENTAVOS para enviar ao cliente (Lovable)
+          const amountInCents = Math.round(amount * 100);
+
+          clientBalances.set(clientSocket.id, amountInCents); // Armazena em centavos
           if (conn) conn.user_balance_id = final_ubid || conn.user_balance_id;
 
-          // Monta o payload de saldo que o cliente espera
           const balancePayload = {
             msg: {
               current_balance: {
                 id: final_ubid,
-                amount,
+                amount: amountInCents, // Envia CENTAVOS para o cliente
                 currency,
-                type: requestedType, // Envia o tipo de conta para o cliente
+                type: requestedType, 
               },
             },
           };
 
-          // Emite o saldo para todos os listeners do cliente
           clientSocket.emit("balance", balancePayload);
           clientSocket.emit("balance-changed", balancePayload);
           clientSocket.emit("current-balance", balancePayload);
+          
+          // Log corrigido para mostrar o valor em dólares
           console.log(
-            `[${short}] Saldo detectado (${requestedType}): ${currency} ${(
-              amount / 100
-            ).toFixed(2)}`
+            `[${short}] Saldo detectado (${requestedType}): ${currency} ${amount.toFixed(2)}`
           );
         }
         return;
       }
-
+      
+      // (Restante das funções de encaminhamento de eventos permanecem as mesmas)
 
       // forward subscription / subscription events
       if (event === "subscription") {
@@ -503,7 +521,6 @@ function connectToBullEx(ssid, accountType, clientSocket) {
         return;
       }
 
-      // price-splitter / pressure events (client-buyback)
       if (
         event === "price-splitter.client-buyback-generated" ||
         event === "client-buyback-generated"
@@ -513,22 +530,20 @@ function connectToBullEx(ssid, accountType, clientSocket) {
         return;
       }
 
-      // positions-state / position-changed
+      // positions-state / position-changed [cite: 660-662, 666]
       if (event === "positions-state") {
         clientSocket.emit("positions-state", data);
         return;
       }
       if (event === "position-changed") {
         clientSocket.emit("position-changed", data);
-        // if position closed, also forward explicit order result event
         const status = data?.msg?.status || data?.msg?.result || null;
         if (status) clientSocket.emit("order-result", data);
         return;
       }
 
-      // candles -> normalize and forward as 'candles'
+      // candles [cite: 666]
       if (event === "candle-generated" || event === "candles-generated") {
-        // normalize shape expected by Lovable
         const m = data.msg || data;
         const normalized = {
           msg: {
@@ -549,10 +564,8 @@ function connectToBullEx(ssid, accountType, clientSocket) {
         return;
       }
 
-      // result responses for specific request_id (order confirmations)
       if (event === "result" && data.request_id) {
         clientSocket.emit("bull_result", data);
-        // if success true and request corresponds to open-option -> emit order-confirmed
         const success = data?.msg?.success;
         if (typeof success !== "undefined") {
           clientSocket.emit("order-response", data);
@@ -574,13 +587,11 @@ function connectToBullEx(ssid, accountType, clientSocket) {
     if (conn) conn.aggregator.clear();
     clientBalances.delete(clientSocket.id);
     clientSocket.emit("disconnected");
-    // try reconnect with exponential backoff (client will reauth if needed)
     if (reconnectAttempts < 6) {
       reconnectAttempts++;
       console.log(`[${short}] reconnect attempt #${reconnectAttempts} in 4s`);
       setTimeout(() => {
         try {
-          // CORREÇÃO: Passa o accountType na reconexão
           const currentConn = connections.get(clientSocket.id);
           if (currentConn) {
              connectToBullEx(ssid, currentConn.accountType, clientSocket);
@@ -600,17 +611,13 @@ function connectToBullEx(ssid, accountType, clientSocket) {
 io.on("connection", (socket) => {
   console.log(`✅ Cliente Socket.IO conectado: ${socket.id}`);
 
-  // =================================================================
-  // CORREÇÃO 1.2: Recebendo `ssid` E `accountType` do cliente
-  // =================================================================
+  // authenticate (correto, recebe accountType)
   socket.on("authenticate", async ({ ssid, accountType }) => {
     if (!ssid)
       return socket.emit("auth_error", { message: "ssid necessário" });
     
-    // Define 'real' como padrão se o cliente não enviar o tipo
     const type = accountType || "real"; 
 
-    // cleanup any previous
     const prev = connections.get(socket.id);
     if (prev && prev.ws && prev.ws.readyState === WebSocket.OPEN) {
       try {
@@ -619,11 +626,10 @@ io.on("connection", (socket) => {
       prev.aggregator.clear();
       connections.delete(socket.id);
     }
-    // make connection
     connectToBullEx(ssid, type, socket);
   });
 
-  // subscribe-active: when client requests an active, map and send subscribe-candles
+  // subscribe-active (correto, usa o ACTIVE_MAP corrigido)
   socket.on("subscribe-active", (payload) => {
     const conn = connections.get(socket.id);
     if (!conn || !conn.ws)
@@ -639,7 +645,7 @@ io.on("connection", (socket) => {
     if (resolved.type === "id") idToSubscribe = resolved.value;
     else {
       textual = resolved.value;
-      idToSubscribe = ACTIVE_MAP[textual];
+      idToSubscribe = ACTIVE_MAP[textual]; // Usa o mapa corrigido
       if (!idToSubscribe)
         return socket.emit("error", {
           message: `Ativo desconhecido: ${textual}`,
@@ -647,7 +653,6 @@ io.on("connection", (socket) => {
     }
 
     try {
-      // unsubscribe prior if different
       const prior = connections.get(socket.id)?.currentActive;
       if (prior && prior !== idToSubscribe) {
         try {
@@ -674,7 +679,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // generic pass-through for sendMessage envelope from client
+  // generic pass-through (correto)
   socket.on("sendMessage", (envelope) => {
     const conn = connections.get(socket.id);
     if (!conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN)
@@ -690,16 +695,13 @@ io.on("connection", (socket) => {
     }
   });
 
-  // =================================================================
-  // CORREÇÃO 3: O nome do evento agora é 'open-position'
-  // =================================================================
+  // open-position (correto, nome do evento e option_type_id default=3) [cite: 652]
   socket.on("open-position", async (order) => {
     const conn = connections.get(socket.id);
     if (!conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN)
       return socket.emit("order-error", { message: "upstream not connected" });
 
     try {
-      // normalize and build body exactly as BullEx expects
       const user_balance_id =
         conn.user_balance_id ||
         order.balance_id ||
@@ -709,20 +711,16 @@ io.on("connection", (socket) => {
         order.active_id || order.assetId || conn.currentActive;
       const direction = (order.direction || "call").toLowerCase();
       
-      // =================================================================
-      // CORREÇÃO 4: `option_type_id` padrão agora é 3 (conforme prompt)
-      // =================================================================
-      const option_type_id = order.option_type_id || 3; // 
+      // Usa o ID 3 como padrão, conforme solicitado [cite: 571, 652]
+      const option_type_id = order.option_type_id || 3; 
 
       const expiration_size = order.expiration_size || order.duration || 60;
-      // price often a scale like 10000 in logs — keep default 10000 (BullEx expects integer scaled value)
       const price = order.price || 10000;
-      // value is amount in cents or formatted per BullEx; accept amount in dollars or cents
+      
+      // Converte o valor de DÓLARES (do app) para CENTAVOS (para a BullEx) [cite: 652]
       const amountCents = toCentsMaybe(order.amount || order.value || 0);
-      // If amountCents null fallback to order.value or price
       const value = order.value || (amountCents != null ? amountCents : 0);
 
-      // craft envelope wrapper expected by BullEx
       const envelope = {
         name: "sendMessage",
         request_id: genRequestId(),
@@ -740,23 +738,21 @@ io.on("connection", (socket) => {
             price,
             profit_percent: order.profit_percent || order.profit || 88,
             refund_value: order.refund_value || 0,
-            value, // value in cents (or as supplied)
+            value, // Envia em centavos
           },
         },
       };
 
       console.log(
         `[${socket.id.slice(0, 8)}] 📤 Enviando ordem BullEx =>`,
-        envelope
+        envelope.msg.body
       );
       conn.ws.send(JSON.stringify(envelope));
 
-      // listen for response matching this request_id within a short window
       const rid = envelope.request_id;
       const responseHandler = (data) => {
         try {
           if (data.request_id && data.request_id === rid) {
-            // success or failure
             const success = data?.msg?.success === true;
             if (success) {
               socket.emit("order-confirmed", { request_id: rid, raw: data });
@@ -767,16 +763,13 @@ io.on("connection", (socket) => {
         } catch (e) {}
       };
 
-      // attach temporary listener on socket to receive 'bull_result' forwarded earlier
       const onResult = (res) => responseHandler(res);
       socket.on("bull_result", onResult);
 
-      // timeout cleanup
       setTimeout(() => {
         socket.off("bull_result", onResult);
       }, 12000);
 
-      // respond ack immediately (client can wait for order-confirmed)
       socket.emit("order-sent", { request_id: rid, envelope });
     } catch (err) {
       console.error("Erro open-position:", err);
@@ -787,6 +780,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("get-balance", () => {
+    // Retorna o saldo em CENTAVOS, como o cliente espera
     const b = clientBalances.get(socket.id);
     if (b !== undefined)
       socket.emit("balance", {
@@ -799,7 +793,6 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    // close underlying bullEx connection
     const conn = connections.get(socket.id);
     if (conn && conn.ws) {
       try {
@@ -816,5 +809,5 @@ io.on("connection", (socket) => {
 // ------------------- Start -------------------
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Proxy BullEx ativo na porta ${PORT}`);
-  console.log(`🌐 Endpoints: /auth/login | /health | /test/ssid/:ssid`);
+  console.log(`🌐 Endpoints: /auth/login | /health`);
 });
