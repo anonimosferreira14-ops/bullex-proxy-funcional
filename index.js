@@ -1,370 +1,299 @@
 /**
- * Proxy BullEx - index.js (FINAL - compatível com seu hook)
- * - Ativo inicial: EURUSD-OTC
- * - Aceita { active: "EURUSD-OTC" } | { name: "EURUSD-OTC" } | "EURUSD-OTC" | 76
- * - Emite: balance, balance-changed, current-balance, candles, position-changed, positions-state, subscription, client-buyback-generated
- * - Não repassa timeSync ao front
+ * index.js
+ * Proxy para BullEx: login (REST + fallback SSID) e proxy WebSocket por cliente.
+ *
+ * Dependências:
+ *   npm i express http socket.io ws node-fetch express-rate-limit
+ *
+ * Use em ambiente Node 18+ (ou ajuste fetch).
  */
 
-import express from "express";
-import { Server } from "socket.io";
-import cors from "cors";
-import WebSocket from "ws";
+import express from 'express';
+import http from 'http';
+import { Server as SocketIOServer } from 'socket.io';
+import WebSocket from 'ws';
+import fetch from 'node-fetch';
+import rateLimit from 'express-rate-limit';
+import crypto from 'crypto';
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
-const PORT = process.env.PORT || 10000;
-const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Proxy BullEx ativo em 0.0.0.0:${PORT}`);
+const server = http.createServer(app);
+const io = new SocketIOServer(server, {
+  cors: {
+    origin: [ 'https://seu-frontend.com', 'http://localhost:3000' ], // ajuste
+    methods: ['GET','POST'],
+  },
 });
 
-const io = new Server(server, {
-  cors: { origin: "*" },
-  transports: ["websocket", "polling"],
+const PORT = process.env.PORT || 3000;
+const BULL_EX_LOGIN = 'https://trade.bull-ex.com/v2/login';
+const BULL_EX_WS = 'wss://ws.trade.bull-ex.com/echo/websocket';
+
+// --- Config de Rate Limit para o endpoint de login (evita brute force) ---
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minuto
+  max: 10, // por IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Muitas tentativas, tente mais tarde.' },
 });
 
-/* ===========================
-   Asset mapping (text -> id)
-   Complete / extend with your ativos bullex.txt
-   =========================== */
-const ACTIVE_MAP = {
-  "EURUSD-OTC": 76,
-  "GBPUSD-OTC": 77,
-  "USDJPY-OTC": 78,
-  "AUDUSD-OTC": 79,
-  "EURJPY-OTC": 80,
-  "EURGBP-OTC": 81,
-  "USDCHF-OTC": 82,
-  "USDCAD-OTC": 83,
-  "EURCAD-OTC": 84,
-  "GBPJPY-OTC": 85,
-  "GBPCHF-OTC": 86,
-  "AUDJPY-OTC": 87,
-  "AUDCAD-OTC": 88,
-  "NZDUSD-OTC": 89,
-  // Blitz examples
-  "BTCUSD-BLZ": 201,
-  "ETHUSD-BLZ": 202,
-  "LTCUSD-BLZ": 203,
-  "EURUSD-BLZ": 204,
-  "GBPUSD-BLZ": 205,
-  "USDJPY-BLZ": 206,
-  "AUDUSD-BLZ": 207,
-  "EURJPY-BLZ": 208,
-  "USDCAD-BLZ": 209,
-  "USDCHF-BLZ": 210,
-};
+// --- Helper: tenta login REST com headers "convincente" e retries ---
+async function tryRestLogin(email, password, attempts = 3) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json, text/plain, */*',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+    'Accept-Language': 'pt-BR,pt;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br, zstd',
+    'Origin': 'https://trade.bull-ex.com',
+    'Referer': 'https://trade.bull-ex.com/login',
+    // 'x-device-id': deviceId, // opcional: passe se tiver
+    // 'x-platform-id': '189',
+  };
 
-/* In-memory stores */
-const connections = new Map(); // socketId -> { ws, aggregator, ssid, user_balance_id, currentActive }
-const clientBalances = new Map(); // socketId -> amount (cents)
+  const body = JSON.stringify({ email, password });
 
-/* Small aggregator to avoid candle spam */
-class SimpleAggregator {
-  constructor() { this.timers = {}; }
-  send(socket, event, data, delay = 100) {
-    if (this.timers[event]) clearTimeout(this.timers[event]);
-    this.timers[event] = setTimeout(() => {
-      try { socket.emit(event, data); } catch (e) {}
-    }, delay);
-  }
-  clear() { Object.values(this.timers).forEach(clearTimeout); }
-}
-
-/* Helpers */
-function toCentsMaybe(val) {
-  if (val == null) return null;
-  const n = Number(val);
-  if (Number.isNaN(n)) return null;
-  if (!Number.isInteger(n)) return Math.round(n * 100);
-  // integer: heuristic - if small treat as dollars -> cents
-  if (n < 100000) return n * 100;
-  return n;
-}
-
-/* Resolve payloads for subscribe-active: accepts many shapes */
-function resolveActivePayload(raw) {
-  if (raw == null) return null;
-  if (typeof raw === "string") return { type: "name", value: raw };
-  if (typeof raw === "number") return { type: "id", value: raw };
-  if (typeof raw === "object") {
-    // common variants
-    if (raw.active && (typeof raw.active === "string" || typeof raw.active === "number")) {
-      return typeof raw.active === "number" ? { type: "id", value: raw.active } : { type: "name", value: raw.active };
-    }
-    if (raw.name && (typeof raw.name === "string" || typeof raw.name === "number")) {
-      return typeof raw.name === "number" ? { type: "id", value: raw.name } : { type: "name", value: raw.name };
-    }
-    if (raw.msg && raw.msg.name && typeof raw.msg.name === "string") return { type: "name", value: raw.msg.name };
-    if (raw.payload && typeof raw.payload === "string") return { type: "name", value: raw.payload };
-  }
-  return null;
-}
-
-/* Send subscribe-candles with compatibility wrappers */
-function sendSubscribeCandles(bullexWs, id, timeframe = "1m") {
-  try {
-    // wrapper sendMessage
-    const wrapper = {
-      name: "sendMessage",
-      msg: {
-        name: "subscribe-candles",
-        version: "1.0",
-        body: { active_id: id, size: 1, at: timeframe },
-      },
-    };
-    bullexWs.send(JSON.stringify(wrapper));
-    // also send direct variant (some servers expect this)
-    bullexWs.send(JSON.stringify({ name: "subscribe-candles", version: "1.0", body: { active_id: id, size: 1, at: timeframe } }));
-  } catch (e) { /* ignore */ }
-}
-
-/* Core: connect per client socket */
-function connectToBullEx(ssid, clientSocket) {
-  const short = clientSocket.id.slice(0, 8);
-  console.log(`📌 [${short}] Iniciando autenticação com BullEx...`);
-
-  const bullexWs = new WebSocket("wss://ws.trade.bull-ex.com/echo/websocket", {
-    headers: { Origin: "https://trade.bull-ex.com", "User-Agent": "Mozilla/5.0" },
-  });
-
-  const aggregator = new SimpleAggregator();
-  let pingInterval = null;
-  let reconnectAttempts = 0;
-
-  // store connection object
-  connections.set(clientSocket.id, { ws: bullexWs, aggregator, ssid, user_balance_id: null, currentActive: null });
-
-  bullexWs.on("open", () => {
-    console.log(`✅ [${short}] Conectado à BullEx. Autenticando...`);
-    reconnectAttempts = 0;
-    bullexWs.send(JSON.stringify({ name: "authenticate", msg: { ssid, protocol: 3, client_session_id: "" } }));
-
-    // ping keepalive to BullEx
-    pingInterval = setInterval(() => {
-      if (bullexWs.readyState === WebSocket.OPEN) try { bullexWs.send(JSON.stringify({ name: "ping" })); } catch (e) {}
-    }, 20000);
-  });
-
-  bullexWs.on("message", (raw) => {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const data = JSON.parse(raw.toString());
-      const event = data.name || data.event || "unknown";
+      const res = await fetch(BULL_EX_LOGIN, {
+        method: 'POST',
+        headers,
+        body,
+      });
 
-      if (!["ping", "pong", "timeSync"].includes(event)) console.log(`📨 [${short}] Evento: ${event}`);
+      const text = await res.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch (e) { json = null; }
 
-      // respond ping
-      if (event === "ping") { bullexWs.send(JSON.stringify({ name: "pong" })); return; }
-      // ignore timeSync flooding to front (we don't forward)
-      if (event === "timeSync") return;
-
-      // AUTH
-      if (event === "authenticated") {
-        clientSocket.emit("authenticated", data);
-
-        // After auth, request balances, positions, actives list and subscribe default EURUSD-OTC
-        setTimeout(() => {
-          try {
-            bullexWs.send(JSON.stringify({ name: "sendMessage", msg: { name: "balances.get-balances", version: "1.0", body: {} } }));
-            bullexWs.send(JSON.stringify({ name: "sendMessage", msg: { name: "subscribe-positions", version: "1.0", body: {} } }));
-            bullexWs.send(JSON.stringify({ name: "sendMessage", msg: { name: "actives.get-all", version: "1.0", body: {} } }));
-            // default subscribe EURUSD-OTC -> id 76 (as requested)
-            const defaultId = ACTIVE_MAP["EURUSD-OTC"];
-            if (defaultId) sendSubscribeCandles(bullexWs, defaultId, "1m");
-            console.log(`💵 [${short}] Pedido de saldo, positions, actives e candles(EURUSD-OTC) enviados`);
-          } catch (e) {}
-        }, 700);
-        return;
+      if (res.ok && json && json.ssid) {
+        return { success: true, ssid: json.ssid, raw: json };
       }
 
-      if (event === "unauthorized") {
-        clientSocket.emit("unauthorized", data);
-        return;
-      }
+      // Se a API retornar 4xx/5xx examinamos o corpo — pode indicar bloqueio/antibot
+      const status = res.status;
+      const snippet = (text || '').slice(0, 500);
+      return { success: false, blocked: true, status, body: snippet };
 
-      // balances array or balance-changed
-      if (event === "balances" || event === "balance-changed") {
-        let amount = null, currency = "USD", ubid = null;
-        if (event === "balance-changed") {
-          const cur = data?.msg?.current_balance;
-          if (cur) { amount = cur.amount; currency = cur.currency || currency; ubid = cur.id || cur.user_balance_id || null; }
-        } else if (event === "balances") {
-          const arr = data.msg;
-          if (Array.isArray(arr) && arr.length) {
-            const usd = arr.find(b => b.currency === "USD") || arr[0];
-            if (usd) { amount = usd.amount; currency = usd.currency || currency; ubid = usd.id || usd.user_balance_id || null; }
-          }
-        }
-        if (amount != null) {
-          clientBalances.set(clientSocket.id, amount);
-          const conn = connections.get(clientSocket.id);
-          if (conn) conn.user_balance_id = ubid || conn.user_balance_id;
-          // emit normalized events (your hook expects 'balance' as shown)
-          clientSocket.emit("balance", { msg: { current_balance: { id: ubid, amount, currency } } });
-          clientSocket.emit("balance-changed", { name: "balance-changed", msg: { current_balance: { id: ubid, amount, currency } } });
-          clientSocket.emit("current-balance", { msg: { current_balance: { id: ubid, amount, currency, timestamp: Date.now() } } });
-          console.log(`💰 [${short}] Saldo detectado: ${currency} $${(amount/100).toFixed(2)}`);
-        }
-        return;
-      }
-
-      // subscription info (forward)
-      if (event === "subscription") {
-        clientSocket.emit("subscription", data);
-        return;
-      }
-
-      // pressure / buyback event -> forward as both names (compat)
-      if (event === "price-splitter.client-buyback-generated" || event === "client-buyback-generated") {
-        clientSocket.emit("price-splitter.client-buyback-generated", data);
-        clientSocket.emit("client-buyback-generated", data); // your hook looks for client-buyback-generated
-        return;
-      }
-
-      // positions-state / position-changed
-      if (event === "positions-state") {
-        clientSocket.emit("positions-state", data);
-        return;
-      }
-      if (event === "position-changed") {
-        clientSocket.emit("position-changed", data);
-        return;
-      }
-
-      // candles high-frequency -> aggregate and forward as "candles"
-      if (event === "candles-generated" || event === "candle-generated") {
-        aggregator.send(clientSocket, "candles", data, 80);
-        return;
-      }
-
-      // default forward
-      clientSocket.emit(event, data);
     } catch (err) {
-      console.error(`⚠️ [${short}] Erro parse Bullex message: ${err.message}`);
-    }
-  });
-
-  bullexWs.on("close", () => {
-    console.warn(`🔴 [${short}] Conexão Bullex encerrada`);
-    if (pingInterval) clearInterval(pingInterval);
-    const conn = connections.get(clientSocket.id);
-    if (conn) conn.aggregator.clear();
-    clientBalances.delete(clientSocket.id);
-    clientSocket.emit("disconnected");
-    // reconnect attempts
-    if (reconnectAttempts < 6) {
-      reconnectAttempts++;
-      console.log(`🔁 [${short}] Reconectando em 4s (#${reconnectAttempts})`);
-      setTimeout(() => { try { connectToBullEx(ssid, clientSocket); } catch (e) {} }, 4000);
-    }
-  });
-
-  bullexWs.on("error", (err) => {
-    console.error(`⚠️ [${short}] Bullex WS error: ${err.message}`);
-    clientSocket.emit("error", { message: err.message });
-  });
-
-  /* ========== Client socket handlers ========== */
-
-  // subscribe-active: robust resolver (accepts many shapes)
-  clientSocket.on("subscribe-active", (rawPayload) => {
-    const resolved = resolveActivePayload(rawPayload);
-    const shortS = clientSocket.id.slice(0, 8);
-    if (!resolved) {
-      clientSocket.emit("error", { message: "subscribe-active requires name or active id (accepted: { active: 'EURUSD-OTC' }, { name: 'EURUSD-OTC' }, string, number)" });
-      console.warn(`⚠️ [${shortS}] subscribe-active payload inválido:`, rawPayload);
-      return;
-    }
-
-    let idToSubscribe = null;
-    let textualName = null;
-    if (resolved.type === "id") {
-      idToSubscribe = resolved.value;
-    } else {
-      textualName = resolved.value;
-      const mapped = ACTIVE_MAP[textualName];
-      if (!mapped) {
-        clientSocket.emit("error", { message: `Ativo desconhecido: ${textualName}` });
-        console.warn(`⚠️ [${shortS}] Ativo textual desconhecido: ${textualName}`);
-        return;
+      // retry com exponential backoff
+      if (attempt < attempts - 1) {
+        const delay = 200 * Math.pow(2, attempt); // 200ms, 400ms, 800ms
+        await new Promise(r => setTimeout(r, delay));
+        continue;
       }
-      idToSubscribe = mapped;
+      return { success: false, error: err.message };
     }
+  }
+}
 
-    const conn = connections.get(clientSocket.id);
-    const prior = conn?.currentActive;
-    try {
-      if (prior && prior !== idToSubscribe) {
-        bullexWs.send(JSON.stringify({ name: "unsubscribe-candles", msg: { active_id: prior } }));
-        console.log(`🧹 [${shortS}] Unsubscribed active ${prior}`);
+// --- Helper: validar SSID abrindo WebSocket e enviando authenticate ---
+async function validateSsidViaWs(ssid, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const ws = new WebSocket(BULL_EX_WS, { handshakeTimeout: timeoutMs });
+
+    const cleanup = () => {
+      try { ws.terminate(); } catch(e) {}
+    };
+
+    const finish = (ok, info = null) => {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      resolve({ valid: ok, info });
+    };
+
+    const timer = setTimeout(() => {
+      finish(false, { reason: 'timeout' });
+    }, timeoutMs);
+
+    ws.on('open', () => {
+      // mensagem de autenticação observada no tráfego do navegador:
+      const msg = {
+        name: "authenticate",
+        msg: {
+          ssid: ssid,
+          protocol: 3,
+          client_session_id: ""
+        }
+      };
+      try {
+        ws.send(JSON.stringify(msg));
+      } catch (e) {
+        clearTimeout(timer);
+        finish(false, { reason: 'send_error', error: e.message });
       }
-    } catch (e) {}
+    });
 
-    try {
-      sendSubscribeCandles(bullexWs, idToSubscribe, "1m");
-      if (conn) conn.currentActive = idToSubscribe;
-      clientSocket.emit("subscribed-active", [{ name: textualName || `id-${idToSubscribe}`, id: idToSubscribe }]);
-      console.log(`📡 [${shortS}] Subscribed active id ${idToSubscribe}`);
-    } catch (e) {
-      clientSocket.emit("error", { message: "Falha ao enviar subscribe-candles" });
-    }
-  });
+    ws.on('message', (data) => {
+      // aguarda por {name: "authenticated", msg: true, client_session_id: "..."}
+      let parsed = null;
+      try { parsed = JSON.parse(data.toString()); } catch(e) { parsed = null; }
+      if (parsed && parsed.name === 'authenticated' && parsed.msg === true) {
+        clearTimeout(timer);
+        finish(true, { client_session_id: parsed.client_session_id || null });
+      } else {
+        // poderia tratar outros casos (por exemplo erro de auth), mas aguardamos timeout
+      }
+    });
 
-  // generic pass-through for orders or other sendMessage calls
-  clientSocket.on("sendMessage", (envelope) => {
-    const conn = connections.get(clientSocket.id);
-    if (!conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
-      clientSocket.emit("error", { message: "Bullex WS não conectado" });
-      return;
-    }
-    const payload = envelope?.msg ? envelope.msg : envelope;
-    try {
-      conn.ws.send(JSON.stringify(payload));
-      console.log(`📤 [${clientSocket.id.slice(0,8)}] Reenviando -> ${payload.name || "message"}`);
-    } catch (e) {
-      clientSocket.emit("error", { message: e.message });
-    }
-  });
+    ws.on('error', (err) => {
+      clearTimeout(timer);
+      finish(false, { reason: 'ws_error', error: err?.message });
+    });
 
-  // heartbeat to client to prevent transport close
-  const heartbeat = setInterval(() => {
-    try { if (clientSocket.connected) clientSocket.emit("ping-proxy", { t: Date.now() }); } catch (e) {}
-  }, 15000);
-
-  clientSocket.on("disconnect", () => {
-    clearInterval(heartbeat);
-    if (pingInterval) clearInterval(pingInterval);
-    try { bullexWs.close(); } catch (e) {}
-    connections.delete(clientSocket.id);
-    clientBalances.delete(clientSocket.id);
-    console.log(`❌ [${clientSocket.id.slice(0,8)}] Cliente desconectado`);
+    ws.on('close', () => {
+      // se não autenticou até aqui, falha
+    });
   });
 }
 
-/* ========== Socket.IO server ========== */
-io.on("connection", (socket) => {
-  console.log(`✅ Cliente conectado (Socket.IO): ${socket.id}`);
-  socket.on("authenticate", ({ ssid }) => {
-    if (!ssid) return socket.emit("error", { message: "SSID não fornecido" });
-    // close previous if exists
-    const prev = connections.get(socket.id);
-    if (prev && prev.ws && prev.ws.readyState === WebSocket.OPEN) {
-      try { prev.ws.close(); } catch (e) {}
-      prev.aggregator.clear();
-      connections.delete(socket.id);
+// --- Endpoint: /auth/login ---
+// Aceita { email, password } ou { ssid }
+app.post('/auth/login', authLimiter, async (req, res) => {
+  try {
+    const { email, password, ssid } = req.body;
+
+    if (ssid) {
+      // validação direta por WS
+      const v = await validateSsidViaWs(ssid, 5000);
+      if (v.valid) {
+        return res.json({ success: true, ssid, validated: true, info: v.info });
+      } else {
+        return res.status(401).json({ success: false, validated: false, message: 'SSID inválido ou expirado', info: v.info });
+      }
     }
-    connectToBullEx(ssid, socket);
+
+    if (!email || !password) {
+      return res.status(400).json({ success: false, message: 'email e password ou ssid são necessários' });
+    }
+
+    const result = await tryRestLogin(email, password, 3);
+
+    if (result.success) {
+      return res.json({ success: true, ssid: result.ssid, raw: result.raw });
+    }
+
+    // Se falhou automaticamente ou foi bloqueado -> retornar need_manual para frontend exibir instruções
+    return res.status(403).json({
+      success: false,
+      need_manual: true,
+      message: 'Autenticação via API REST bloqueada ou falhou. Cole o SSID manualmente.',
+      details: {
+        status: result.status || null,
+        error: result.error || null,
+        snippet: result.body || null,
+      }
+    });
+
+  } catch (err) {
+    console.error('[/auth/login] erro interno:', err);
+    return res.status(500).json({ success: false, message: 'erro interno' });
+  }
+});
+
+// --- Health e rota estática básica ---
+app.get('/health', (req, res) => res.json({ ok: true, time: Date.now() }));
+
+// --- Gerenciamento de conexões socket.io ---
+// Por design simples: para cada cliente socket.io, abrimos um WebSocket upstream
+// para BullEx após receber 'authenticate' com { ssid }.
+// Mapeamos socket.id -> upstreamWs para encaminhar mensagens.
+const clientUpstreams = new Map(); // socketId => { ws, ssid, lastSeen }
+
+io.on('connection', (socket) => {
+  console.log(`[SOCKET] conectado: ${socket.id}`);
+
+  socket.on('authenticate', async (payload) => {
+    try {
+      const { ssid } = payload || {};
+      if (!ssid) {
+        socket.emit('auth_error', { message: 'ssid necessário' });
+        return;
+      }
+
+      // opcional: validar curto antes de criar conexão persistente
+      const valid = await validateSsidViaWs(ssid, 4000);
+      if (!valid.valid) {
+        socket.emit('auth_error', { message: 'SSID inválido', info: valid.info });
+        return;
+      }
+
+      // Cria conexão WebSocket persistente com BullEx para este cliente
+      const upstream = new WebSocket(BULL_EX_WS);
+
+      upstream.on('open', () => {
+        // enviar authenticate novamente (fluxo normal)
+        const authMsg = {
+          name: "authenticate",
+          msg: { ssid, protocol: 3, client_session_id: "" }
+        };
+        upstream.send(JSON.stringify(authMsg));
+      });
+
+      upstream.on('message', (data) => {
+        // repassa mensagens do BullEx para o cliente socket
+        // tente parse para objeto JSON ao repassar quando possível
+        let parsed = null;
+        try { parsed = JSON.parse(data.toString()); } catch(e) { parsed = null; }
+        socket.emit('bull_message', parsed ?? data.toString());
+      });
+
+      upstream.on('close', (code, reason) => {
+        socket.emit('bull_closed', { code, reason: reason?.toString?.() ?? reason });
+      });
+
+      upstream.on('error', (err) => {
+        socket.emit('bull_error', { message: err?.message });
+      });
+
+      // salvar upstream no mapa
+      // se já existia uma upstream, fechamos antes
+      if (clientUpstreams.has(socket.id)) {
+        try { clientUpstreams.get(socket.id).ws.terminate(); } catch(e){}
+      }
+      clientUpstreams.set(socket.id, { ws: upstream, ssid, lastSeen: Date.now() });
+
+      socket.emit('auth_ok', { message: 'autenticado no proxy', validated: valid.info });
+
+    } catch (err) {
+      console.error('[socket authenticate] erro', err);
+      socket.emit('auth_error', { message: 'erro interno no proxy' });
+    }
   });
 
-  socket.on("get-balance", () => {
-    const b = clientBalances.get(socket.id);
-    if (b !== undefined) socket.emit("balance", { msg: { current_balance: { amount: b, currency: "USD" } } });
-    else socket.emit("balance", { msg: { current_balance: { amount: 0, currency: "USD" } } });
+  // Repassar mensagens do cliente para BullEx (ex: subscribe, buy, etc)
+  // O cliente deve enviar { to: 'bull', msg: {...} } ou similar; aqui assumimos 'bull_send'
+  socket.on('bull_send', (payload) => {
+    const entry = clientUpstreams.get(socket.id);
+    if (!entry || !entry.ws || entry.ws.readyState !== WebSocket.OPEN) {
+      socket.emit('bull_error', { message: 'upstream não conectado' });
+      return;
+    }
+    try {
+      // payload pode ser objeto ou string
+      const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+      entry.ws.send(data);
+    } catch (err) {
+      socket.emit('bull_error', { message: 'erro ao enviar upstream', error: err.message });
+    }
+  });
+
+  socket.on('disconnect', (reason) => {
+    console.log(`[SOCKET] desconectado: ${socket.id}`, reason);
+    const entry = clientUpstreams.get(socket.id);
+    if (entry && entry.ws) {
+      try { entry.ws.terminate(); } catch(e){}
+    }
+    clientUpstreams.delete(socket.id);
   });
 });
 
-/* Health endpoints */
-app.get("/health", (req, res) => res.json({ status: "ok", connections: connections.size }));
-app.get("/", (req, res) => res.json({ message: "Proxy BullEx final rodando ✅", connections: connections.size }));
+// --- Iniciar servidor ---
+server.listen(PORT, () => {
+  console.log(`Proxy rodando na porta ${PORT}`);
+  console.log(`Endpoints: /auth/login, socket.io conectado na mesma porta.`);
+});
