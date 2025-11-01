@@ -1,11 +1,9 @@
 /**
- * Proxy BullEx - versão consolidada (FINAL)
- * - Login híbrido (email/senha ou SSID manual)
- * - Proxy WebSocket completo com candles, balances e posições
- * - Compatível com seu hook React e com o Lovable
- *
- * Dependências:
- * npm i express http socket.io ws node-fetch express-rate-limit cors
+ * 🔧 Proxy BullEx — versão revisada e funcional
+ * Corrige:
+ *  - Login REST 401 (agora tenta extrair SSID do header e body)
+ *  - Validação via WS (sem fechar antes da resposta)
+ *  - Compatibilidade Lovable + hook React
  */
 
 import express from "express";
@@ -16,92 +14,89 @@ import fetch from "node-fetch";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 
-// =======================
-// Configuração básica
-// =======================
 const app = express();
-app.use(express.json({ limit: "1mb" }));
-app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 
 const server = http.createServer(app);
-const io = new SocketIOServer(server, {
-  cors: {
-    origin: "*", // ajuste se quiser limitar ao seu domínio
-    methods: ["GET", "POST"],
-  },
-});
+const io = new SocketIOServer(server, { cors: { origin: "*" } });
 
 const PORT = process.env.PORT || 10000;
-const BULL_EX_LOGIN = "https://trade.bull-ex.com/v2/login";
+const BULL_EX_LOGIN = "https://api.trade.bull-ex.com/v2/login";
 const BULL_EX_WS = "wss://ws.trade.bull-ex.com/echo/websocket";
 
 // =======================
-// Rate Limiter
+// Rate limiter
 // =======================
 const authLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minuto
+  windowMs: 60 * 1000,
   max: 10,
-  message: { success: false, message: "Muitas tentativas. Aguarde um minuto." },
+  message: { success: false, message: "Muitas tentativas, aguarde." },
 });
 
 // =======================
-// Helpers
+// Helper: tentativa de login
 // =======================
-async function tryRestLogin(email, password, attempts = 3) {
+async function tryRestLogin(email, password) {
   const headers = {
     "Content-Type": "application/json",
     Accept: "application/json, text/plain, */*",
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-    "Accept-Language": "pt-BR,pt;q=0.9",
     Origin: "https://trade.bull-ex.com",
     Referer: "https://trade.bull-ex.com/login",
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
   };
 
-  const body = JSON.stringify({ email, password });
+  try {
+    const res = await fetch(BULL_EX_LOGIN, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ email, password }),
+    });
 
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    try {
-      const res = await fetch(BULL_EX_LOGIN, { method: "POST", headers, body });
-      const text = await res.text();
-      let json;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        json = null;
-      }
+    const body = await res.text();
+    const rawHeaders = Object.fromEntries(res.headers.entries());
 
-      if (res.ok && json?.ssid) {
-        return { success: true, ssid: json.ssid, raw: json };
-      }
+    // tenta extrair SSID do header ou body
+    const cookie = rawHeaders["set-cookie"] || "";
+    const ssid =
+      cookie.match(/SSID=([^;]+)/)?.[1] ||
+      body.match(/"ssid"\s*:\s*"([^"]+)"/i)?.[1] ||
+      body.match(/"SSID"\s*:\s*"([^"]+)"/i)?.[1] ||
+      null;
 
-      if (attempt < attempts - 1) {
-        await new Promise((r) => setTimeout(r, 200 * Math.pow(2, attempt)));
-        continue;
-      }
-
-      return { success: false, blocked: true, status: res.status, body: text };
-    } catch (err) {
-      if (attempt < attempts - 1) {
-        await new Promise((r) => setTimeout(r, 200 * Math.pow(2, attempt)));
-        continue;
-      }
-      return { success: false, error: err.message };
+    if (ssid) {
+      console.log("✅ SSID extraído:", ssid.slice(0, 8) + "...");
+      return { success: true, ssid, body, headers: rawHeaders };
     }
+
+    return {
+      success: false,
+      message: "Falha ao obter SSID",
+      status: res.status,
+      body,
+    };
+  } catch (err) {
+    console.error("❌ Erro no tryRestLogin:", err.message);
+    return { success: false, error: err.message };
   }
 }
 
 // =======================
-// Validação SSID via WS
+// Helper: valida SSID via WebSocket
 // =======================
-async function validateSsidViaWs(ssid, timeoutMs = 5000) {
+async function validateSsidViaWs(ssid, timeoutMs = 7000) {
   return new Promise((resolve) => {
     const ws = new WebSocket(BULL_EX_WS);
+    let resolved = false;
     const timer = setTimeout(() => {
-      try {
-        ws.terminate();
-      } catch {}
-      resolve({ valid: false, reason: "timeout" });
+      if (!resolved) {
+        resolved = true;
+        try {
+          ws.terminate();
+        } catch {}
+        resolve({ valid: false, reason: "timeout" });
+      }
     }, timeoutMs);
 
     ws.on("open", () => {
@@ -116,75 +111,73 @@ async function validateSsidViaWs(ssid, timeoutMs = 5000) {
     ws.on("message", (msg) => {
       try {
         const data = JSON.parse(msg.toString());
-        if (data.name === "authenticated" && data.msg === true) {
+        if (data.name === "authenticated" && data.msg === true && !resolved) {
+          resolved = true;
           clearTimeout(timer);
           ws.terminate();
-          resolve({ valid: true, info: data });
+          resolve({ valid: true });
         }
       } catch {}
     });
 
-    ws.on("error", () => {
-      clearTimeout(timer);
-      resolve({ valid: false, reason: "ws_error" });
+    ws.on("error", (err) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve({ valid: false, reason: err.message });
+      }
     });
 
     ws.on("close", () => {
-      clearTimeout(timer);
-      resolve({ valid: false, reason: "closed" });
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve({ valid: false, reason: "closed" });
+      }
     });
   });
 }
 
 // =======================
-// Endpoint /auth/login
+// /auth/login
 // =======================
 app.post("/auth/login", authLimiter, async (req, res) => {
-  try {
-    const { email, password, ssid } = req.body;
+  const { email, password, ssid } = req.body;
 
-    if (ssid) {
-      const valid = await validateSsidViaWs(ssid);
-      if (valid.valid)
-        return res.json({ success: true, ssid, validated: true });
-      return res
-        .status(401)
-        .json({ success: false, validated: false, message: "SSID inválido" });
-    }
-
-    if (!email || !password)
-      return res.status(400).json({
-        success: false,
-        message: "email e password ou ssid são necessários",
-      });
-
-    const result = await tryRestLogin(email, password);
-    if (result.success)
-      return res.json({ success: true, ssid: result.ssid, raw: result.raw });
-
-    return res.status(403).json({
-      success: false,
-      need_manual: true,
-      message: "Autenticação via API REST bloqueada. Cole o SSID manualmente.",
-      details: result,
-    });
-  } catch (err) {
-    console.error("Erro /auth/login:", err);
-    res.status(500).json({ success: false, message: "erro interno" });
+  if (ssid) {
+    const valid = await validateSsidViaWs(ssid);
+    if (valid.valid) return res.json({ success: true, ssid, validated: true });
+    return res
+      .status(401)
+      .json({ success: false, validated: false, message: "SSID inválido" });
   }
+
+  if (!email || !password)
+    return res
+      .status(400)
+      .json({ success: false, message: "Informe email e senha ou SSID." });
+
+  const result = await tryRestLogin(email, password);
+  if (result.success)
+    return res.json({ success: true, ssid: result.ssid, validated: true });
+
+  return res.status(403).json({
+    success: false,
+    message: "Login falhou. Cole SSID manualmente.",
+    details: result,
+  });
 });
 
 // =======================
-// Proxy WebSocket
+// WebSocket Proxy
 // =======================
 const clientUpstreams = new Map();
 
 io.on("connection", (socket) => {
-  console.log(`[SOCKET] conectado: ${socket.id}`);
+  console.log(`🔌 Cliente conectado: ${socket.id}`);
 
   socket.on("authenticate", async ({ ssid }) => {
-    if (!ssid)
-      return socket.emit("auth_error", { message: "ssid necessário" });
+    if (!ssid) return socket.emit("auth_error", { message: "SSID necessário" });
 
     const valid = await validateSsidViaWs(ssid);
     if (!valid.valid)
@@ -199,12 +192,12 @@ io.on("connection", (socket) => {
           msg: { ssid, protocol: 3, client_session_id: "" },
         })
       );
+      socket.emit("auth_ok", { message: "Conectado à BullEx" });
     });
 
     upstream.on("message", (data) => {
       try {
-        const parsed = JSON.parse(data.toString());
-        socket.emit("bull_message", parsed);
+        socket.emit("bull_message", JSON.parse(data.toString()));
       } catch {
         socket.emit("bull_message", data.toString());
       }
@@ -218,36 +211,29 @@ io.on("connection", (socket) => {
     );
 
     clientUpstreams.set(socket.id, upstream);
-    socket.emit("auth_ok", { message: "autenticado no proxy" });
   });
 
   socket.on("bull_send", (payload) => {
     const upstream = clientUpstreams.get(socket.id);
     if (!upstream || upstream.readyState !== WebSocket.OPEN)
-      return socket.emit("bull_error", { message: "upstream não conectado" });
+      return socket.emit("bull_error", { message: "Upstream não conectado" });
 
-    try {
-      upstream.send(
-        typeof payload === "string" ? payload : JSON.stringify(payload)
-      );
-    } catch (err) {
-      socket.emit("bull_error", { message: err.message });
-    }
+    upstream.send(typeof payload === "string" ? payload : JSON.stringify(payload));
   });
 
   socket.on("disconnect", () => {
     const upstream = clientUpstreams.get(socket.id);
     if (upstream) try { upstream.terminate(); } catch {}
     clientUpstreams.delete(socket.id);
-    console.log(`[SOCKET] desconectado: ${socket.id}`);
+    console.log(`❌ Cliente saiu: ${socket.id}`);
   });
 });
 
 // =======================
-// Healthcheck
+// /health
 // =======================
 app.get("/health", (req, res) =>
-  res.json({ ok: true, connections: clientUpstreams.size })
+  res.json({ ok: true, clients: clientUpstreams.size, ts: Date.now() })
 );
 
 // =======================
@@ -255,5 +241,5 @@ app.get("/health", (req, res) =>
 // =======================
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Proxy BullEx ativo na porta ${PORT}`);
-  console.log(`Endpoints: /auth/login, /health`);
+  console.log(`🌐 Endpoints: /auth/login | /health`);
 });
