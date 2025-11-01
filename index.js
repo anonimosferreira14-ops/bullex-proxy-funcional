@@ -3,6 +3,9 @@
  * - Login híbrido (email/senha ou SSID manual)
  * - Proxy WebSocket completo com candles, balances e posições
  * - Compatível com seu hook React e com o Lovable
+ *
+ * Dependências:
+ * npm i express http socket.io ws node-fetch express-rate-limit cors
  */
 
 import express from "express";
@@ -13,17 +16,17 @@ import fetch from "node-fetch";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 
-/* =======================
-   Configuração básica
-======================= */
+// =======================
+// Configuração básica
+// =======================
 const app = express();
-app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+app.use(cors());
 
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   cors: {
-    origin: "*", // ajuste para seu domínio se quiser limitar
+    origin: "*", // ajuste se quiser limitar ao seu domínio
     methods: ["GET", "POST"],
   },
 });
@@ -32,18 +35,18 @@ const PORT = process.env.PORT || 10000;
 const BULL_EX_LOGIN = "https://trade.bull-ex.com/v2/login";
 const BULL_EX_WS = "wss://ws.trade.bull-ex.com/echo/websocket";
 
-/* =======================
-   Rate Limiter
-======================= */
+// =======================
+// Rate Limiter
+// =======================
 const authLimiter = rateLimit({
-  windowMs: 60 * 1000,
+  windowMs: 60 * 1000, // 1 minuto
   max: 10,
   message: { success: false, message: "Muitas tentativas. Aguarde um minuto." },
 });
 
-/* =======================
-   Helpers
-======================= */
+// =======================
+// Helpers
+// =======================
 async function tryRestLogin(email, password, attempts = 3) {
   const headers = {
     "Content-Type": "application/json",
@@ -59,11 +62,7 @@ async function tryRestLogin(email, password, attempts = 3) {
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const res = await fetch(BULL_EX_LOGIN, {
-        method: "POST",
-        headers,
-        body,
-      });
+      const res = await fetch(BULL_EX_LOGIN, { method: "POST", headers, body });
       const text = await res.text();
       let json;
       try {
@@ -92,11 +91,16 @@ async function tryRestLogin(email, password, attempts = 3) {
   }
 }
 
+// =======================
+// Validação SSID via WS
+// =======================
 async function validateSsidViaWs(ssid, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const ws = new WebSocket(BULL_EX_WS);
     const timer = setTimeout(() => {
-      ws.terminate();
+      try {
+        ws.terminate();
+      } catch {}
       resolve({ valid: false, reason: "timeout" });
     }, timeoutMs);
 
@@ -122,14 +126,19 @@ async function validateSsidViaWs(ssid, timeoutMs = 5000) {
 
     ws.on("error", () => {
       clearTimeout(timer);
-      resolve({ valid: false, reason: "error" });
+      resolve({ valid: false, reason: "ws_error" });
+    });
+
+    ws.on("close", () => {
+      clearTimeout(timer);
+      resolve({ valid: false, reason: "closed" });
     });
   });
 }
 
-/* =======================
-   Endpoint /auth/login
-======================= */
+// =======================
+// Endpoint /auth/login
+// =======================
 app.post("/auth/login", authLimiter, async (req, res) => {
   try {
     const { email, password, ssid } = req.body;
@@ -143,21 +152,21 @@ app.post("/auth/login", authLimiter, async (req, res) => {
         .json({ success: false, validated: false, message: "SSID inválido" });
     }
 
-    if (!email || !password) {
-      return res
-        .status(400)
-        .json({ success: false, message: "email e password ou ssid são necessários" });
-    }
+    if (!email || !password)
+      return res.status(400).json({
+        success: false,
+        message: "email e password ou ssid são necessários",
+      });
 
     const result = await tryRestLogin(email, password);
-
-    if (result.success) return res.json({ success: true, ssid: result.ssid });
+    if (result.success)
+      return res.json({ success: true, ssid: result.ssid, raw: result.raw });
 
     return res.status(403).json({
       success: false,
       need_manual: true,
-      message:
-        "Autenticação via API REST bloqueada. Cole o SSID manualmente.",
+      message: "Autenticação via API REST bloqueada. Cole o SSID manualmente.",
+      details: result,
     });
   } catch (err) {
     console.error("Erro /auth/login:", err);
@@ -165,16 +174,17 @@ app.post("/auth/login", authLimiter, async (req, res) => {
   }
 });
 
-/* =======================
-   Proxy WebSocket
-======================= */
+// =======================
+// Proxy WebSocket
+// =======================
 const clientUpstreams = new Map();
 
 io.on("connection", (socket) => {
   console.log(`[SOCKET] conectado: ${socket.id}`);
 
   socket.on("authenticate", async ({ ssid }) => {
-    if (!ssid) return socket.emit("auth_error", { message: "ssid necessário" });
+    if (!ssid)
+      return socket.emit("auth_error", { message: "ssid necessário" });
 
     const valid = await validateSsidViaWs(ssid);
     if (!valid.valid)
@@ -192,13 +202,12 @@ io.on("connection", (socket) => {
     });
 
     upstream.on("message", (data) => {
-      let parsed;
       try {
-        parsed = JSON.parse(data.toString());
+        const parsed = JSON.parse(data.toString());
+        socket.emit("bull_message", parsed);
       } catch {
-        parsed = data.toString();
+        socket.emit("bull_message", data.toString());
       }
-      socket.emit("bull_message", parsed);
     });
 
     upstream.on("close", () =>
@@ -234,16 +243,16 @@ io.on("connection", (socket) => {
   });
 });
 
-/* =======================
-   Healthcheck
-======================= */
+// =======================
+// Healthcheck
+// =======================
 app.get("/health", (req, res) =>
   res.json({ ok: true, connections: clientUpstreams.size })
 );
 
-/* =======================
-   Start server
-======================= */
+// =======================
+// Start server
+// =======================
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Proxy BullEx ativo na porta ${PORT}`);
   console.log(`Endpoints: /auth/login, /health`);
