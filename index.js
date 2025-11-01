@@ -1,9 +1,9 @@
 /**
- * 🔧 Proxy BullEx — versão revisada e funcional
- * Corrige:
- *  - Login REST 401 (agora tenta extrair SSID do header e body)
- *  - Validação via WS (sem fechar antes da resposta)
- *  - Compatibilidade Lovable + hook React
+ * 🔧 Proxy BullEx — versão final e estável
+ * - Login híbrido (email/senha ou SSID)
+ * - Validação via WebSocket
+ * - Proxy WebSocket completo para Lovable
+ * - CORS liberado
  */
 
 import express from "express";
@@ -14,7 +14,11 @@ import fetch from "node-fetch";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 
+// =======================
+// Configuração inicial
+// =======================
 const app = express();
+app.set("trust proxy", 1); // ✅ Corrige aviso do express-rate-limit no Render
 app.use(express.json({ limit: "2mb" }));
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 
@@ -26,16 +30,16 @@ const BULL_EX_LOGIN = "https://api.trade.bull-ex.com/v2/login";
 const BULL_EX_WS = "wss://ws.trade.bull-ex.com/echo/websocket";
 
 // =======================
-// Rate limiter
+// Rate Limiter (protege endpoint de login)
 // =======================
 const authLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
-  message: { success: false, message: "Muitas tentativas, aguarde." },
+  message: { success: false, message: "Muitas tentativas. Aguarde um minuto." },
 });
 
 // =======================
-// Helper: tentativa de login
+// Função: Login via API REST da BullEx
 // =======================
 async function tryRestLogin(email, password) {
   const headers = {
@@ -66,7 +70,7 @@ async function tryRestLogin(email, password) {
       null;
 
     if (ssid) {
-      console.log("✅ SSID extraído:", ssid.slice(0, 8) + "...");
+      console.log("✅ SSID extraído:", ssid.slice(0, 10) + "...");
       return { success: true, ssid, body, headers: rawHeaders };
     }
 
@@ -83,7 +87,7 @@ async function tryRestLogin(email, password) {
 }
 
 // =======================
-// Helper: valida SSID via WebSocket
+// Função: Valida SSID via WebSocket
 // =======================
 async function validateSsidViaWs(ssid, timeoutMs = 7000) {
   return new Promise((resolve) => {
@@ -139,7 +143,7 @@ async function validateSsidViaWs(ssid, timeoutMs = 7000) {
 }
 
 // =======================
-// /auth/login
+// Rota /auth/login
 // =======================
 app.post("/auth/login", authLimiter, async (req, res) => {
   const { email, password, ssid } = req.body;
@@ -169,7 +173,7 @@ app.post("/auth/login", authLimiter, async (req, res) => {
 });
 
 // =======================
-// WebSocket Proxy
+// Proxy WebSocket
 // =======================
 const clientUpstreams = new Map();
 
@@ -230,14 +234,14 @@ io.on("connection", (socket) => {
 });
 
 // =======================
-// /health
+// Healthcheck
 // =======================
 app.get("/health", (req, res) =>
   res.json({ ok: true, clients: clientUpstreams.size, ts: Date.now() })
 );
 
 // =======================
-// Start server
+// Inicia servidor
 // =======================
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Proxy BullEx ativo na porta ${PORT}`);
